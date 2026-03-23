@@ -1,0 +1,22 @@
+services:
+  sports-edge:
+    build: .
+    image: sports-edge:latest
+    container_name: sports-edge
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env                    # secrets stay out of the image
+    volumes:
+      - cache_data:/app/data/cache   # persist parsed stats between container restarts
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  cache_data:
+    driver: local

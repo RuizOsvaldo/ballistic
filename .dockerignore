@@ -1,0 +1,40 @@
+# Secrets — never in image
+.env
+.env.local
+.env.*.local
+
+# Cache — mounted as volume, not baked in
+data/cache/
+data/bet_log.csv
+*.parquet
+
+# Git
+.git/
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Tests — not needed at runtime
+tests/
+
+# Dev tools
+.pre-commit-config.yaml
+.secrets.baseline
+.coverage
+htmlcov/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Docs — optional, remove if you want them in image for reference
+# docs/

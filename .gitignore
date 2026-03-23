@@ -1,0 +1,58 @@
+# Environment / secrets — never commit these
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Cache and data
+data/cache/
+data/bet_log.csv
+*.parquet
+*.csv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# detect-secrets baseline (keep the baseline, not secrets)
+# .secrets.baseline  <- intentionally NOT ignored (safe to commit)
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Docker
+docker-compose.override.yml
