@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import datetime
+import unicodedata
 
 import pandas as pd
 import plotly.express as px
@@ -24,6 +25,45 @@ from src.models.player_props import (
 from src.shared.groq_agent import analyze_mlb_prop
 
 CURRENT_SEASON = datetime.datetime.now().year
+
+# FanGraphs abbreviation → Odds API full team name
+_FG_TEAM_MAP: dict[str, str] = {
+    "ARI": "Arizona Diamondbacks",
+    "ATH": "Athletics",
+    "ATL": "Atlanta Braves",
+    "BAL": "Baltimore Orioles",
+    "BOS": "Boston Red Sox",
+    "CHC": "Chicago Cubs",
+    "CHW": "Chicago White Sox",
+    "CIN": "Cincinnati Reds",
+    "CLE": "Cleveland Guardians",
+    "COL": "Colorado Rockies",
+    "DET": "Detroit Tigers",
+    "HOU": "Houston Astros",
+    "KCR": "Kansas City Royals",
+    "LAA": "Los Angeles Angels",
+    "LAD": "Los Angeles Dodgers",
+    "MIA": "Miami Marlins",
+    "MIL": "Milwaukee Brewers",
+    "MIN": "Minnesota Twins",
+    "NYM": "New York Mets",
+    "NYY": "New York Yankees",
+    "PHI": "Philadelphia Phillies",
+    "PIT": "Pittsburgh Pirates",
+    "SDP": "San Diego Padres",
+    "SEA": "Seattle Mariners",
+    "SFG": "San Francisco Giants",
+    "STL": "St. Louis Cardinals",
+    "TBR": "Tampa Bay Rays",
+    "TEX": "Texas Rangers",
+    "TOR": "Toronto Blue Jays",
+    "WSN": "Washington Nationals",
+}
+
+
+def _normalize(name: str) -> str:
+    """Strip accents and lowercase for fuzzy name matching."""
+    return unicodedata.normalize("NFD", name).encode("ascii", "ignore").decode("ascii").lower().strip()
 
 
 @st.cache_data(ttl=3600 * 6, show_spinner="Loading pitcher stats...")
@@ -195,18 +235,24 @@ def _build_batter_projections(
     lineup_available: bool,
 ) -> pd.DataFrame:
     """Project hits/game for all eligible batters and return sorted projection DataFrame."""
+    # Build normalized lookup sets for matching
+    today_teams_norm = {_normalize(t) for t in today_teams}
+    lineup_norm = {_normalize(n) for n in lineup_names}
+
     results = []
     for _, row in batter_df.iterrows():
         if pd.isna(row.get("babip")) or pd.isna(row.get("k_pct")):
             continue
-        team = row.get("team", "")
-        if team not in today_teams:
+
+        fg_abbr = row.get("team", "")
+        full_team = _FG_TEAM_MAP.get(fg_abbr, fg_abbr)
+        if _normalize(full_team) not in today_teams_norm:
             continue
 
         name = row.get("name", "")
 
         # Lineup filter: if lineups are posted, only include confirmed starters
-        if lineup_available and name not in lineup_names:
+        if lineup_available and _normalize(name) not in lineup_norm:
             continue
 
         pa = row.get("pa", 0) or 0
@@ -224,7 +270,7 @@ def _build_batter_projections(
 
         results.append({
             "name": name,
-            "Team": team,
+            "Team": full_team,
             "babip": round(row["babip"], 3),
             "babip_dev": babip_dev,
             "wrc_plus": row.get("wrc_plus"),
@@ -348,17 +394,12 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
         )
         return
 
-    # Merge projections with prop lines by player name
-    # Try exact match first, then last-name fallback
-    proj_df["_last"] = proj_df["name"].str.split().str[-1].str.lower()
-    props_df["_last"] = props_df["player_name"].str.split().str[-1].str.lower()
+    # Merge projections with prop lines using normalized names (handles accents)
+    proj_df["_norm"] = proj_df["name"].apply(_normalize)
+    props_df["_norm"] = props_df["player_name"].apply(_normalize)
 
-    merged = proj_df.merge(props_df, left_on="name", right_on="player_name", how="inner")
-    if merged.empty:
-        # Last-name fallback
-        merged = proj_df.merge(props_df, on="_last", how="inner")
-
-    merged = merged.drop(columns=["_last"], errors="ignore")
+    merged = proj_df.merge(props_df, on="_norm", how="inner")
+    merged = merged.drop(columns=["_norm"], errors="ignore")
 
     if merged.empty:
         st.info("Could not match player names between model and prop lines. Name format may differ.")
