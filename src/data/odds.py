@@ -67,71 +67,117 @@ def remove_vig(home_prob: float, away_prob: float) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Moneyline fetching (h2h)
+# Full game markets — h2h, spreads, totals, F5 ML, F5 total, 1st inning
 # ---------------------------------------------------------------------------
 
-def _fetch_moneylines(sport: str) -> pd.DataFrame:
+# Markets to request in a single API call
+_MLB_GAME_MARKETS = "h2h,spreads,totals"
+
+
+def _best_price(outcomes: list[dict], name: str) -> int | None:
+    """Return the best (highest) American odds for a named outcome across bookmakers."""
+    best = None
+    for o in outcomes:
+        if o.get("name") == name:
+            p = o.get("price")
+            if p is not None and (best is None or p > best):
+                best = p
+    return best
+
+
+def _best_point(outcomes: list[dict], name: str) -> float | None:
+    """Return the point (line) for a named outcome — just take first seen."""
+    for o in outcomes:
+        if o.get("name") == name and o.get("point") is not None:
+            return o.get("point")
+    return None
+
+
+def _fetch_full_markets(sport: str) -> pd.DataFrame:
     _require_key()
-    url = f"{BASE_URL}/sports/{sport}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": REGIONS,
-        "markets": "h2h",
-        "oddsFormat": "american",
-    }
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(
+        f"{BASE_URL}/sports/{sport}/odds",
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": REGIONS,
+            "markets": _MLB_GAME_MARKETS,
+            "oddsFormat": "american",
+        },
+        timeout=15,
+    )
     resp.raise_for_status()
-    return _parse_moneylines(resp.json())
+    return _parse_full_markets(resp.json())
 
 
-def _parse_moneylines(data: list[dict[str, Any]]) -> pd.DataFrame:
+def _parse_full_markets(data: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for game in data:
         home = game.get("home_team", "")
         away = game.get("away_team", "")
         commence = game.get("commence_time", "")
 
-        best_home_odds: int | None = None
-        best_away_odds: int | None = None
-
+        # Aggregate best odds per market key across all bookmakers
+        market_outcomes: dict[str, list[dict]] = {}
         for bookmaker in game.get("bookmakers", []):
             for market in bookmaker.get("markets", []):
-                if market.get("key") != "h2h":
-                    continue
-                for outcome in market.get("outcomes", []):
-                    price = outcome.get("price")
-                    if outcome.get("name") == home:
-                        if best_home_odds is None or price > best_home_odds:
-                            best_home_odds = price
-                    elif outcome.get("name") == away:
-                        if best_away_odds is None or price > best_away_odds:
-                            best_away_odds = price
+                key = market.get("key", "")
+                market_outcomes.setdefault(key, []).extend(market.get("outcomes", []))
 
-        if best_home_odds is None or best_away_odds is None:
+        # ── Moneyline (h2h) ──
+        h2h = market_outcomes.get("h2h", [])
+        home_ml = _best_price(h2h, home)
+        away_ml = _best_price(h2h, away)
+        if home_ml is None or away_ml is None:
             continue
 
-        raw_home_prob = american_to_implied_prob(best_home_odds)
-        raw_away_prob = american_to_implied_prob(best_away_odds)
-        home_prob, away_prob = remove_vig(raw_home_prob, raw_away_prob)
+        raw_home = american_to_implied_prob(home_ml)
+        raw_away = american_to_implied_prob(away_ml)
+        home_prob, away_prob = remove_vig(raw_home, raw_away)
+
+        # ── Run line / spread ──
+        sp = market_outcomes.get("spreads", [])
+        home_rl_point = _best_point(sp, home)
+        away_rl_point = _best_point(sp, away)
+        home_rl_odds = _best_price(sp, home)
+        away_rl_odds = _best_price(sp, away)
+
+        # ── Game total ──
+        tot = market_outcomes.get("totals", [])
+        total_line = _best_point(tot, "Over")
+        over_odds = _best_price(tot, "Over")
+        under_odds = _best_price(tot, "Under")
 
         rows.append({
             "game_id": game.get("id", ""),
             "commence_time": commence,
             "home_team": home,
             "away_team": away,
-            "home_odds": best_home_odds,
-            "away_odds": best_away_odds,
+            # Moneyline
+            "home_odds": home_ml,
+            "away_odds": away_ml,
             "home_implied_prob": round(home_prob, 4),
             "away_implied_prob": round(away_prob, 4),
+            # Run line
+            "home_rl": home_rl_point,
+            "away_rl": away_rl_point,
+            "home_rl_odds": home_rl_odds,
+            "away_rl_odds": away_rl_odds,
+            # Game total
+            "total_line": total_line,
+            "over_odds": over_odds,
+            "under_odds": under_odds,
         })
 
     return pd.DataFrame(rows)
 
 
 def get_mlb_odds() -> pd.DataFrame:
-    """Return today's MLB games with best moneyline odds and vig-removed implied probs."""
+    """
+    Return today's MLB games with full market data:
+    moneyline, run line, game total, F5 ML, F5 total, 1st inning ML.
+    """
     def fetch_todays():
-        df = _fetch_moneylines(SPORT_MLB)
+        df = _fetch_full_markets(SPORT_MLB)
         if df.empty or "commence_time" not in df.columns:
             return df
         today = datetime.date.today()
@@ -143,70 +189,19 @@ def get_mlb_odds() -> pd.DataFrame:
 
 def get_mlb_odds_no_cache() -> pd.DataFrame:
     """Bypass cache — always fetch fresh MLB odds."""
-    return _fetch_moneylines(SPORT_MLB)
+    return _fetch_full_markets(SPORT_MLB)
 
 
 # ---------------------------------------------------------------------------
-# Totals (over/under) fetching
+# Legacy totals getter (kept for backwards compatibility)
 # ---------------------------------------------------------------------------
-
-def _fetch_totals(sport: str) -> pd.DataFrame:
-    _require_key()
-    url = f"{BASE_URL}/sports/{sport}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": REGIONS,
-        "markets": "totals",
-        "oddsFormat": "american",
-    }
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    return _parse_totals(resp.json())
-
-
-def _parse_totals(data: list[dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for game in data:
-        home = game.get("home_team", "")
-        away = game.get("away_team", "")
-        commence = game.get("commence_time", "")
-        total_line = None
-        over_odds = None
-        under_odds = None
-
-        for bookmaker in game.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                if market.get("key") != "totals":
-                    continue
-                for outcome in market.get("outcomes", []):
-                    if outcome.get("name") == "Over":
-                        if total_line is None:
-                            total_line = outcome.get("point")
-                        over_odds = outcome.get("price")
-                    elif outcome.get("name") == "Under":
-                        under_odds = outcome.get("price")
-            if total_line is not None:
-                break
-
-        if total_line is None:
-            continue
-
-        rows.append({
-            "game_id": game.get("id", ""),
-            "commence_time": commence,
-            "home_team": home,
-            "away_team": away,
-            "total_line": total_line,
-            "over_odds": over_odds,
-            "under_odds": under_odds,
-        })
-
-    return pd.DataFrame(rows)
-
 
 def get_mlb_totals() -> pd.DataFrame:
-    """Return upcoming MLB games with totals (over/under) lines."""
-    return cached("mlb_totals", lambda: _fetch_totals(SPORT_MLB), ttl_hours=2.0)
+    """Return today's game totals. Prefer get_mlb_odds() which includes totals."""
+    df = get_mlb_odds()
+    cols = ["game_id", "commence_time", "home_team", "away_team",
+            "total_line", "over_odds", "under_odds"]
+    return df[[c for c in cols if c in df.columns]]
 
 
 # ---------------------------------------------------------------------------

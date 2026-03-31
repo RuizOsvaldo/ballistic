@@ -28,6 +28,23 @@ def _format_matchup(row) -> str:
     return f"{row.get('away_team', '?')} @ {row.get('home_team', '?')}"
 
 
+def _fmt_odds(val) -> str:
+    """Format American odds as string, e.g. +150 or -110."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "N/A"
+    v = int(val)
+    return f"+{v}" if v > 0 else str(v)
+
+
+def _fmt_line(point, odds) -> str:
+    """Format a spread/run-line entry like '-1.5 (-115)'."""
+    if point is None or (isinstance(point, float) and pd.isna(point)):
+        return "N/A"
+    sign = "+" if float(point) > 0 else ""
+    odds_str = f" ({_fmt_odds(odds)})" if odds is not None and not (isinstance(odds, float) and pd.isna(odds)) else ""
+    return f"{sign}{point}{odds_str}"
+
+
 def _clear_odds_cache() -> None:
     from src.data.cache import _cache_path
     for key in ["mlb_odds", f"mlb_starters_{datetime.date.today().isoformat()}"]:
@@ -117,6 +134,40 @@ def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
                             if p.get("fip") and p.get("era"):
                                 signals[f"{prefix}_fip_era_gap"] = round(float(p["fip"]) - float(p["era"]), 2)
                             signals[f"{prefix}_babip"] = p.get("babip")
+
+            # ── Additional Markets ──────────────────────────────────────
+            st.markdown("**Additional Markets**")
+            m1, m2, m3, m4 = st.columns(4)
+
+            # Game total
+            total = row.get("total_line")
+            over_o = row.get("over_odds")
+            under_o = row.get("under_odds")
+            if total is not None and not (isinstance(total, float) and pd.isna(total)):
+                m1.metric("Game Total (O/U)", str(total))
+                m1.caption(f"Over {_fmt_odds(over_o)} / Under {_fmt_odds(under_o)}")
+            else:
+                m1.metric("Game Total", "N/A")
+
+            # Run line (home)
+            home_rl = row.get("home_rl")
+            away_rl = row.get("away_rl")
+            if home_rl is not None and not (isinstance(home_rl, float) and pd.isna(home_rl)):
+                m2.metric(
+                    "Run Line",
+                    f"{row.get('home_team','Home')} {_fmt_line(home_rl, row.get('home_rl_odds'))}",
+                )
+                m2.caption(f"{row.get('away_team','Away')} {_fmt_line(away_rl, row.get('away_rl_odds'))}")
+            else:
+                m2.metric("Run Line", "N/A")
+
+            # F5 and F1 — require API plan upgrade
+            m3.metric("F5 ML / F5 Total", "—")
+            m3.caption("Requires The Odds API 'Pro' plan")
+            m4.metric("1st Inning ML", "—")
+            m4.caption("Requires The Odds API 'Pro' plan")
+
+            st.divider()
 
             if st.button("Generate AI Analysis", key=f"ai_{row.get('game_id', team)}"):
                 with st.spinner("Analyzing with Llama 3.3 70B..."):
@@ -238,8 +289,11 @@ def render(
         "away_implied_prob": "Away Mkt%",
         "best_bet_side": "Bet Side",
         "best_bet_edge": "Best Edge%",
-        "home_odds": "Home Line",
-        "away_odds": "Away Line",
+        "home_odds": "Home ML",
+        "away_odds": "Away ML",
+        "total_line": "Total",
+        "home_rl": "Home RL",
+        "away_rl": "Away RL",
     }
     available = {k: v for k, v in display_cols.items() if k in filtered.columns}
     display_df = filtered[list(available.keys())].rename(columns=available)
