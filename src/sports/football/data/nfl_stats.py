@@ -5,11 +5,25 @@ from __future__ import annotations
 import datetime
 import warnings
 import pandas as pd
-import nfl_data_py as nfl
 
 from src.data.cache import cached
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    import nfl_data_py as nfl
+    _NFL_AVAILABLE = True
+except ImportError:
+    nfl = None  # type: ignore[assignment]
+    _NFL_AVAILABLE = False
+
+
+def _require_nfl():
+    if not _NFL_AVAILABLE:
+        raise ImportError(
+            "nfl_data_py is not installed. It requires pandas<2.0 which conflicts with "
+            "the rest of this project. NFL features are temporarily disabled."
+        )
 
 
 def _current_season() -> int:
@@ -22,6 +36,7 @@ def _current_season() -> int:
 # ---------------------------------------------------------------------------
 
 def get_nfl_team_epa(season: int | None = None) -> pd.DataFrame:
+    _require_nfl()
     """
     Return team offensive and defensive EPA/play for the season.
 
@@ -88,6 +103,7 @@ def get_nfl_team_epa(season: int | None = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_nfl_schedule(season: int | None = None) -> pd.DataFrame:
+    _require_nfl()
     """
     Return NFL schedule with spread lines, totals, stadium type, and weather.
 
@@ -137,6 +153,7 @@ def get_current_week_games(season: int | None = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_nfl_player_stats(season: int | None = None) -> pd.DataFrame:
+    _require_nfl()
     """
     Return seasonal player stats (summed from weekly).
 
@@ -176,6 +193,7 @@ def get_nfl_player_stats(season: int | None = None) -> pd.DataFrame:
 
 
 def get_nfl_snap_counts(season: int | None = None) -> pd.DataFrame:
+    _require_nfl()
     """Return snap count data for usage context."""
     season = season or _current_season()
 
@@ -195,6 +213,7 @@ def get_nfl_snap_counts(season: int | None = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_nfl_win_totals(season: int | None = None) -> pd.DataFrame:
+    _require_nfl()
     """Return preseason Vegas win total lines per team."""
     season = season or _current_season()
 

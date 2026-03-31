@@ -1,4 +1,4 @@
-"""Bet log page — CSV-backed bet tracking with model calibration reporting."""
+"""Bet log page — SQLite-backed bet tracking with model calibration reporting."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import pandas as pd
 import streamlit as st
 
+from src.data.bet_log_db import (
+    COLUMNS, OUTCOMES, SIGNAL_TYPES,
+    load_bets, insert_bet, save_all,
+)
 from src.models.calibration import (
     compute_calibration_table,
     compute_edge_vs_outcome,
@@ -16,32 +20,17 @@ from src.models.calibration import (
     recommend_threshold_adjustments,
 )
 
-BET_LOG_PATH = Path("data/bet_log.csv")
 
-COLUMNS = [
-    "date", "matchup", "bet_side", "line", "stake", "edge_pct",
-    "model_prob", "signal_type", "outcome", "pnl", "notes",
-]
-
-OUTCOMES = ["Pending", "Win", "Loss", "Push"]
-
-SIGNAL_TYPES = ["None", "Pythagorean", "FIP-ERA", "BABIP", "Multiple"]
-
-
-def _load_log() -> pd.DataFrame:
-    if BET_LOG_PATH.exists():
-        df = pd.read_csv(BET_LOG_PATH)
-        # Back-fill columns added in this sprint for older rows
-        for col in COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-        return df[COLUMNS]
-    return pd.DataFrame(columns=COLUMNS)
-
-
-def _save_log(df: pd.DataFrame) -> None:
-    BET_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(BET_LOG_PATH, index=False)
+def _compute_pnl(outcome: str, stake: float, line: int | float) -> float:
+    """Compute profit/loss from outcome, stake, and American line."""
+    if outcome == "Win":
+        if line > 0:
+            return round(stake * line / 100, 2)
+        else:
+            return round(stake * 100 / abs(line), 2)
+    elif outcome == "Loss":
+        return -abs(stake)
+    return 0.0
 
 
 def _compute_pnl(outcome: str, stake: float, line: int | float) -> float:
@@ -57,9 +46,10 @@ def _compute_pnl(outcome: str, stake: float, line: int | float) -> float:
 
 
 def render() -> None:
-    st.header("Bet Log")
+    st.header("📒 Bet Log")
+    st.caption("Stored in SQLite (data/bet_log.db) — free, local, no limits.")
 
-    log = _load_log()
+    log = load_bets()
 
     tab_log, tab_cal = st.tabs(["Bet Log", "Calibration Report"])
 
@@ -98,7 +88,7 @@ def render() -> None:
 
             if submitted:
                 pnl = _compute_pnl(outcome, stake, line) if outcome != "Pending" else 0.0
-                new_row = pd.DataFrame([{
+                insert_bet({
                     "date": str(date),
                     "matchup": matchup,
                     "bet_side": bet_side,
@@ -110,9 +100,7 @@ def render() -> None:
                     "outcome": outcome,
                     "pnl": pnl,
                     "notes": notes,
-                }])
-                log = pd.concat([log, new_row], ignore_index=True)
-                _save_log(log)
+                })
                 st.success(f"Bet logged: {bet_side} ({matchup})")
                 st.rerun()
 
@@ -161,7 +149,7 @@ def render() -> None:
                     if r["outcome"] != "Pending" else 0.0,
                     axis=1,
                 )
-                _save_log(edited)
+                save_all(edited)
                 st.success("Bet log saved.")
                 st.rerun()
         else:

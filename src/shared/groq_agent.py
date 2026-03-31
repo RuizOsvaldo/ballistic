@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import os
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))
 
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 _MODEL = "llama-3.3-70b-versatile"
