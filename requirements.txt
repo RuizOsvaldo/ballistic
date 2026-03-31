@@ -1,6 +1,8 @@
 streamlit>=1.35.0
 nba_api>=1.4.1
-nfl_data_py>=0.3.3
+# nfl_data_py pinned to 0.3.3 (only release) requires pandas<2.0 — conflicts with pandas>=2.2.0
+# Re-enable when a pandas-2.x compatible release is available
+# nfl_data_py>=0.3.3
 appdirs>=1.4.4
 pandas>=2.2.0
 numpy>=1.26.0

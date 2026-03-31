@@ -25,8 +25,10 @@ env/
 ENV/
 
 # Cache and data
-data/cache/
+data/cache/*
+!data/cache/.gitkeep
 data/bet_log.csv
+data/bet_log.db
 *.parquet
 *.csv
 

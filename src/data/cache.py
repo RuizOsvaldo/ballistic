@@ -1,13 +1,15 @@
 """Disk-backed parquet cache with per-key TTL for API and data calls."""
 
+from __future__ import annotations
+
 import os
 import time
 from pathlib import Path
 
 import pandas as pd
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))
 
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 

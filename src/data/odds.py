@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 from typing import Any
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 from src.data.cache import cached
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 BASE_URL = "https://api.the-odds-api.com/v4"
@@ -128,8 +129,16 @@ def _parse_moneylines(data: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def get_mlb_odds() -> pd.DataFrame:
-    """Return upcoming MLB games with best moneyline odds and vig-removed implied probs."""
-    return cached("mlb_odds", lambda: _fetch_moneylines(SPORT_MLB), ttl_hours=2.0)
+    """Return today's MLB games with best moneyline odds and vig-removed implied probs."""
+    def fetch_todays():
+        df = _fetch_moneylines(SPORT_MLB)
+        if df.empty or "commence_time" not in df.columns:
+            return df
+        today = datetime.date.today()
+        df["_date"] = pd.to_datetime(df["commence_time"], utc=True).dt.tz_convert("America/New_York").dt.date
+        df = df[df["_date"] == today].drop(columns=["_date"]).reset_index(drop=True)
+        return df
+    return cached("mlb_odds", fetch_todays, ttl_hours=2.0)
 
 
 def get_mlb_odds_no_cache() -> pd.DataFrame:
@@ -252,6 +261,58 @@ def get_mlb_player_props(event_id: str) -> pd.DataFrame:
     """
     cache_key = f"mlb_props_{event_id}"
     return cached(cache_key, lambda: _fetch_player_props(SPORT_MLB, event_id, MLB_PROP_MARKETS), ttl_hours=2.0)
+
+
+def get_all_batter_hits_props(games_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fetch batter_hits props for all today's games and return a clean DataFrame.
+
+    Parameters
+    ----------
+    games_df : DataFrame with game_id, home_team, away_team columns (from get_mlb_odds)
+
+    Returns
+    -------
+    DataFrame with: player_name, home_team, away_team, prop_line, over_odds, under_odds
+    """
+    if games_df.empty or "game_id" not in games_df.columns:
+        return pd.DataFrame()
+
+    all_props: list[pd.DataFrame] = []
+    for _, game in games_df.iterrows():
+        try:
+            raw = get_mlb_player_props(str(game["game_id"]))
+            if raw.empty:
+                continue
+            hits = raw[raw["market"] == "batter_hits"].copy()
+            if hits.empty:
+                continue
+            all_props.append(hits)
+        except Exception:
+            continue
+
+    if not all_props:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_props, ignore_index=True)
+    best = get_best_prop_lines(combined)
+    if best.empty:
+        return pd.DataFrame()
+
+    # Pivot over/under into one row per player per line
+    over_rows = best[best["bet_name"] == "Over"][
+        ["player_name", "home_team", "away_team", "prop_line", "odds"]
+    ].rename(columns={"odds": "over_odds"})
+    under_rows = best[best["bet_name"] == "Under"][
+        ["player_name", "home_team", "away_team", "prop_line", "odds"]
+    ].rename(columns={"odds": "under_odds"})
+
+    merged = over_rows.merge(
+        under_rows[["player_name", "home_team", "away_team", "prop_line", "under_odds"]],
+        on=["player_name", "home_team", "away_team", "prop_line"],
+        how="outer",
+    )
+    return merged.dropna(subset=["player_name", "prop_line"]).reset_index(drop=True)
 
 
 def get_best_prop_lines(props_df: pd.DataFrame) -> pd.DataFrame:

@@ -120,7 +120,7 @@ def get_pitcher_stats(season: int) -> pd.DataFrame:
 # Batter stats — wRC+, BABIP, K%, BB%, sprint speed
 # ---------------------------------------------------------------------------
 
-def get_batter_stats(season: int, min_pa: int = 100) -> pd.DataFrame:
+def get_batter_stats(season: int, min_pa: int = 10) -> pd.DataFrame:
     """
     Return qualified batter stats via FanGraphs batting leaderboard.
     Columns: name, team, pa, avg, obp, slg, wrc_plus, babip, k_pct, bb_pct,
