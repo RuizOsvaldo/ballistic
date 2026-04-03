@@ -14,6 +14,7 @@ from src.dashboard.components.edge_table import render_edge_table
 from src.dashboard.components.signal_cards import severity_badge
 from src.shared.groq_agent import analyze_mlb_game
 from src.data.predictions_db import save_predictions
+from src.data.game_results import get_live_games
 
 
 # Status badge HTML
@@ -29,7 +30,6 @@ def _format_matchup(row) -> str:
 
 
 def _fmt_odds(val) -> str:
-    """Format American odds as string, e.g. +150 or -110."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "N/A"
     v = int(val)
@@ -37,7 +37,6 @@ def _fmt_odds(val) -> str:
 
 
 def _fmt_line(point, odds) -> str:
-    """Format a spread/run-line entry like '-1.5 (-115)'."""
     if point is None or (isinstance(point, float) and pd.isna(point)):
         return "N/A"
     sign = "+" if float(point) > 0 else ""
@@ -53,9 +52,53 @@ def _clear_odds_cache() -> None:
             p.unlink()
 
 
-def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
-                      team_stats: pd.DataFrame | None,
-                      pitcher_stats: pd.DataFrame | None) -> None:
+def _add_to_slip(bet: dict) -> None:
+    """Add a bet to the session-state bet slip, avoiding duplicate keys."""
+    if "bet_slip" not in st.session_state:
+        st.session_state.bet_slip = []
+    existing_keys = {b["key"] for b in st.session_state.bet_slip}
+    if bet["key"] not in existing_keys:
+        st.session_state.bet_slip.append(bet)
+
+
+def _build_runs_per_game(team_stats: pd.DataFrame | None) -> dict:
+    """Return {team: (rs_per_g, ra_per_g)} from team_stats."""
+    lookup: dict[str, tuple[float, float]] = {}
+    if team_stats is None or team_stats.empty:
+        return lookup
+    for _, r in team_stats.iterrows():
+        try:
+            w = float(r.get("wins", 0) or 0)
+            l = float(r.get("losses", 0) or 0)
+            g = max(w + l, 1.0)
+            rs = float(r.get("runs_scored", 0) or 0)
+            ra = float(r.get("runs_allowed", 0) or 0)
+            lookup[r["team"]] = (rs / g, ra / g)
+        except Exception:
+            continue
+    return lookup
+
+
+def _proj_total_for(row, rpg: dict) -> float | None:
+    """Compute projected game total from runs-per-game lookup."""
+    home = row.get("home_team", "")
+    away = row.get("away_team", "")
+    if home not in rpg or away not in rpg:
+        return None
+    h_rs, h_ra = rpg[home]
+    a_rs, a_ra = rpg[away]
+    home_exp = (h_rs + a_ra) / 2
+    away_exp = (a_rs + h_ra) / 2
+    return round(home_exp + away_exp, 2)
+
+
+def _render_bet_cards(
+    bets: pd.DataFrame,
+    bankroll: float,
+    team_stats: pd.DataFrame | None,
+    pitcher_stats: pd.DataFrame | None,
+    rpg: dict,
+) -> None:
     if bets.empty:
         st.info("No bets meet the minimum edge threshold today.")
         return
@@ -63,36 +106,43 @@ def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
     for _, row in bets.iterrows():
         side = row["best_bet_side"]
         team = row["home_team"] if side == "HOME" else row["away_team"]
-        opp = row["away_team"] if side == "HOME" else row["home_team"]
-        odds_key = "home_odds" if side == "HOME" else "away_odds"
-        kelly_key = "home_kelly_pct" if side == "HOME" else "away_kelly_pct"
-        edge_key = "home_edge_pct" if side == "HOME" else "away_edge_pct"
-        model_key = "home_model_prob" if side == "HOME" else "away_model_prob"
+        opp  = row["away_team"] if side == "HOME" else row["home_team"]
+        odds_key    = "home_odds"     if side == "HOME" else "away_odds"
+        kelly_key   = "home_kelly_pct" if side == "HOME" else "away_kelly_pct"
+        edge_key    = "home_edge_pct"  if side == "HOME" else "away_edge_pct"
+        model_key   = "home_model_prob" if side == "HOME" else "away_model_prob"
         implied_key = "home_implied_prob" if side == "HOME" else "away_implied_prob"
 
-        edge = row[edge_key]
-        kelly_pct = row[kelly_key]
+        edge        = row[edge_key]
+        kelly_pct   = row[kelly_key]
         dollar_stake = bankroll * kelly_pct / 100
-        line = row.get(odds_key, "N/A")
-        line_str = f"+{line}" if isinstance(line, (int, float)) and line > 0 else str(line)
-        model_prob = row.get(model_key, 0)
+        line        = row.get(odds_key, "N/A")
+        line_str    = f"+{line}" if isinstance(line, (int, float)) and line > 0 else str(line)
+        model_prob  = row.get(model_key, 0)
         implied_prob = row.get(implied_key, 0)
-        status = row.get("lineup_status", "None")
+        status      = row.get("lineup_status", "None")
+        matchup     = f"{row.get('away_team','?')} @ {row.get('home_team','?')}"
+        game_key    = row.get("game_id", f"{row.get('home_team','')}_{row.get('away_team','')}")
 
         severity = "High" if edge >= 7 else "Medium" if edge >= 4 else "Low"
         badge = severity_badge(severity, f"{edge:.1f}% edge")
+
+        # Compute O/U recommendation fresh from team stats
+        total     = row.get("total_line")
+        over_o    = row.get("over_odds")
+        under_o   = row.get("under_odds")
+        proj_total = _proj_total_for(row, rpg)
 
         with st.expander(
             f"{team} vs {opp}  |  {edge:.1f}% edge  |  Line: {line_str}  |  Stake: ${dollar_stake:,.0f}",
             expanded=edge >= 6,
         ):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Model Prob", f"{model_prob:.1%}")
+            c1.metric("Model Prob",  f"{model_prob:.1%}")
             c2.metric("Market Prob", f"{implied_prob:.1%}")
-            c3.metric("Edge", f"{edge:+.1f}%")
+            c3.metric("Edge",        f"{edge:+.1f}%")
             c4.metric("Kelly Stake", f"${dollar_stake:,.0f} ({kelly_pct:.1f}%)")
 
-            # Starter info
             home_starter = row.get("home_starter")
             away_starter = row.get("away_starter")
             s_col1, s_col2, s_col3 = st.columns([1, 2, 2])
@@ -104,7 +154,7 @@ def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
                 st.caption(f"✈️ {row.get('away_team','?')}: **{away_starter or 'TBD'}**")
 
             if status == "None":
-                st.caption("⚠️ No starters confirmed — prediction uses season Pythagorean only. Pitcher FIP adjustment not applied.")
+                st.caption("⚠️ No starters confirmed — prediction uses season Pythagorean only.")
             elif status == "Partial":
                 st.caption("⚠️ One starter TBD — FIP adjustment applied for confirmed starter only.")
 
@@ -113,7 +163,7 @@ def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
                 unsafe_allow_html=True,
             )
 
-            # Build signals dict
+            # Build signals dict for AI
             signals = {}
             if team_stats is not None and not team_stats.empty:
                 for t, prefix in [(row["home_team"], "home"), (row["away_team"], "away")]:
@@ -135,41 +185,107 @@ def _render_bet_cards(bets: pd.DataFrame, bankroll: float,
                                 signals[f"{prefix}_fip_era_gap"] = round(float(p["fip"]) - float(p["era"]), 2)
                             signals[f"{prefix}_babip"] = p.get("babip")
 
-            # ── Additional Markets ──────────────────────────────────────
+            # ── Additional Markets ─────────────────────────────────────
             st.markdown("**Additional Markets**")
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2 = st.columns(2)
 
-            # Game total
-            total = row.get("total_line")
-            over_o = row.get("over_odds")
-            under_o = row.get("under_odds")
+            # Game Total — always show Over or Under using fresh proj_total
             if total is not None and not (isinstance(total, float) and pd.isna(total)):
-                m1.metric("Game Total (O/U)", str(total))
-                m1.caption(f"Over {_fmt_odds(over_o)} / Under {_fmt_odds(under_o)}")
+                if proj_total is not None:
+                    if proj_total >= float(total):
+                        ou_label   = f"Over {total}"
+                        ou_odds    = _fmt_odds(over_o)
+                        ou_bet_key = f"ou_{game_key}"
+                        ou_line    = over_o
+                    else:
+                        ou_label   = f"Under {total}"
+                        ou_odds    = _fmt_odds(under_o)
+                        ou_bet_key = f"ou_{game_key}"
+                        ou_line    = under_o
+                    m1.metric("Game Total", ou_label)
+                    m1.caption(f"Model projects {proj_total:.1f} runs  |  Odds: {ou_odds}")
+                else:
+                    ou_label   = None
+                    ou_bet_key = f"ou_{game_key}"
+                    ou_line    = None
+                    m1.metric("Game Total", str(total))
+                    m1.caption(f"Over {_fmt_odds(over_o)}  |  Under {_fmt_odds(under_o)}")
             else:
+                ou_label = None
+                ou_bet_key = None
+                ou_line = None
                 m1.metric("Game Total", "N/A")
 
-            # Run line (home)
+            # Run Line
             home_rl = row.get("home_rl")
             away_rl = row.get("away_rl")
+            rl_label = None
+            rl_line  = None
             if home_rl is not None and not (isinstance(home_rl, float) and pd.isna(home_rl)):
-                m2.metric(
-                    "Run Line",
-                    f"{row.get('home_team','Home')} {_fmt_line(home_rl, row.get('home_rl_odds'))}",
-                )
-                m2.caption(f"{row.get('away_team','Away')} {_fmt_line(away_rl, row.get('away_rl_odds'))}")
+                rl_point    = home_rl if side == "HOME" else away_rl
+                rl_odds_val = row.get("home_rl_odds") if side == "HOME" else row.get("away_rl_odds")
+                sign        = "+" if float(rl_point) > 0 else ""
+                rl_label    = f"{team} {sign}{rl_point}"
+                rl_line     = rl_odds_val
+                m2.metric("Run Line", rl_label)
+                m2.caption(f"Odds: {_fmt_odds(rl_odds_val)}")
             else:
                 m2.metric("Run Line", "N/A")
 
-            # F5 and F1 — require API plan upgrade
-            m3.metric("F5 ML / F5 Total", "—")
-            m3.caption("Requires The Odds API 'Pro' plan")
-            m4.metric("1st Inning ML", "—")
-            m4.caption("Requires The Odds API 'Pro' plan")
+            # ── Bet Slip Buttons ───────────────────────────────────────
+            st.divider()
+            st.caption("**Add to Bet Slip:**")
+            slip_c1, slip_c2, slip_c3, slip_c4 = st.columns([2, 2, 2, 4])
+
+            with slip_c1:
+                if st.button(f"+ ML: {team}", key=f"slip_ml_{game_key}"):
+                    _add_to_slip({
+                        "key": f"ml_{game_key}",
+                        "matchup": matchup,
+                        "description": f"ML: {team} {line_str}",
+                        "bet_type": "ML",
+                        "line": float(line) if isinstance(line, (int, float)) else 0,
+                        "edge_pct": edge,
+                        "model_prob": round(model_prob, 4),
+                        "stake": round(dollar_stake, 2),
+                    })
+                    st.toast(f"Added: ML {team}", icon="📌")
+
+            with slip_c2:
+                if rl_label and st.button(f"+ RL: {rl_label}", key=f"slip_rl_{game_key}"):
+                    _add_to_slip({
+                        "key": f"rl_{game_key}",
+                        "matchup": matchup,
+                        "description": f"RL: {rl_label}",
+                        "bet_type": "RL",
+                        "line": float(rl_line) if isinstance(rl_line, (int, float)) else 0,
+                        "edge_pct": edge,
+                        "model_prob": round(model_prob, 4),
+                        "stake": round(dollar_stake, 2),
+                    })
+                    st.toast(f"Added: RL {rl_label}", icon="📌")
+                elif not rl_label:
+                    st.button("+ RL: N/A", key=f"slip_rl_{game_key}", disabled=True)
+
+            with slip_c3:
+                if ou_label and st.button(f"+ {ou_label}", key=f"slip_ou_{game_key}"):
+                    _add_to_slip({
+                        "key": f"ou_{game_key}",
+                        "matchup": matchup,
+                        "description": f"O/U: {ou_label}",
+                        "bet_type": "O/U",
+                        "line": float(ou_line) if isinstance(ou_line, (int, float)) else 0,
+                        "edge_pct": 0.0,
+                        "model_prob": None,
+                        "stake": 50.0,
+                    })
+                    st.toast(f"Added: {ou_label}", icon="📌")
+                elif not ou_label:
+                    st.button("+ O/U: N/A", key=f"slip_ou_{game_key}", disabled=True)
 
             st.divider()
 
-            if st.button("Generate AI Analysis", key=f"ai_{row.get('game_id', team)}"):
+            if st.button("Generate AI Analysis", key=f"ai_{game_key}"):
                 with st.spinner("Analyzing with Llama 3.3 70B..."):
                     result = analyze_mlb_game(
                         home_team=row["home_team"],
@@ -204,9 +320,29 @@ def render(
             st.cache_data.clear()
             st.rerun()
 
+    # ── Live Games Panel ──────────────────────────────────────────────────────
+    live_df = get_live_games()
+    if not live_df.empty:
+        st.subheader("🔴 Games In Progress")
+        for _, lg in live_df.iterrows():
+            inning_str = f"{'Top' if lg.get('inning_half','').lower()=='top' else 'Bot'} {lg.get('inning','?')}"
+            home_p = lg.get("home_current_pitcher") or "Unknown"
+            away_p = lg.get("away_current_pitcher") or "Unknown"
+            score  = f"{lg.get('away_score','?')} – {lg.get('home_score','?')}"
+            st.markdown(
+                f"**{lg['away_team']} @ {lg['home_team']}** &nbsp; `{score}` &nbsp; {inning_str}  \n"
+                f"Current pitchers: **{lg['away_team']}** → {away_p} &nbsp;|&nbsp; **{lg['home_team']}** → {home_p}",
+                unsafe_allow_html=True,
+            )
+        st.caption("Refresh the page to update live scores and current pitchers.")
+        st.divider()
+
     if games_with_kelly.empty:
         st.warning("No games loaded. Check your ODDS_API_KEY in .env and ensure there are upcoming MLB games.")
         return
+
+    # Build runs-per-game lookup from team_stats — used for O/U recommendations
+    rpg = _build_runs_per_game(team_stats)
 
     # Auto-save predictions
     df = games_with_kelly.copy()
@@ -216,18 +352,17 @@ def render(
         except Exception:
             pass
 
-    # Split: no team stats match vs has model probs
     has_prob = df["home_model_prob"].notna() & df["away_model_prob"].notna()
-    ready_df = df[has_prob].copy()
+    ready_df   = df[has_prob].copy()
     pending_df = df[~has_prob].copy()
 
     ready_df["matchup"] = ready_df.apply(_format_matchup, axis=1)
 
     # ---- Lineup status legend ----
     status_counts = ready_df["lineup_status"].value_counts() if "lineup_status" in ready_df.columns else {}
-    full_n = status_counts.get("Full", 0)
+    full_n    = status_counts.get("Full", 0)
     partial_n = status_counts.get("Partial", 0)
-    none_n = status_counts.get("None", 0) + len(pending_df)
+    none_n    = status_counts.get("None", 0) + len(pending_df)
 
     lc1, lc2, lc3 = st.columns(3)
     lc1.markdown(f'{_STATUS_HTML["Full"]} &nbsp; **{full_n}** game(s)', unsafe_allow_html=True)
@@ -235,7 +370,6 @@ def render(
     lc3.markdown(f'{_STATUS_HTML["None"]} &nbsp; **{none_n}** game(s)', unsafe_allow_html=True)
     st.divider()
 
-    # ---- Games with no team stats (cannot model at all) ----
     if not pending_df.empty:
         st.subheader(f"⏳ No Team Data — Cannot Predict ({len(pending_df)})")
         st.caption("Team stats could not be matched. These games are shown for reference only.")
@@ -253,7 +387,7 @@ def render(
     # ---- Filters ----
     col1, col2, col3 = st.columns(3)
     with col1:
-        all_teams = sorted(set(ready_df["home_team"].tolist() + ready_df["away_team"].tolist()))
+        all_teams    = sorted(set(ready_df["home_team"].tolist() + ready_df["away_team"].tolist()))
         selected_team = st.selectbox("Filter by team", ["All"] + all_teams)
     with col2:
         min_edge = st.slider("Min edge %", 0.0, 20.0, 3.0, 0.5)
@@ -269,33 +403,62 @@ def render(
 
     st.caption(f"{len(filtered)} game(s) shown | Bankroll: ${bankroll:,.0f}")
 
-    # ---- Section 1: Full lineups confirmed ----
-    full_games = filtered[filtered.get("lineup_status", pd.Series(dtype=str)) == "Full"] \
-        if "lineup_status" in filtered.columns else pd.DataFrame()
-    partial_games = filtered[filtered.get("lineup_status", pd.Series(dtype=str)) == "Partial"] \
-        if "lineup_status" in filtered.columns else pd.DataFrame()
-    no_lineup_games = filtered[filtered.get("lineup_status", pd.Series(dtype=str)) == "None"] \
-        if "lineup_status" in filtered.columns else filtered
+    # ---- Pick summary columns (use rpg for O/U — no dependency on proj_total column) ----
+    def _ml_pick(row) -> str:
+        side = row.get("best_bet_side", "PASS")
+        if side == "PASS":
+            return "PASS"
+        t = row.get("home_team") if side == "HOME" else row.get("away_team")
+        odds_key = "home_odds" if side == "HOME" else "away_odds"
+        return f"{t} {_fmt_odds(row.get(odds_key))}"
 
-    # ---- Edge summary table (all filtered games) ----
+    def _rl_pick(row) -> str:
+        side = row.get("best_bet_side", "PASS")
+        if side == "PASS":
+            return "—"
+        t = row.get("home_team") if side == "HOME" else row.get("away_team")
+        rl_key      = "home_rl"      if side == "HOME" else "away_rl"
+        rl_odds_key = "home_rl_odds" if side == "HOME" else "away_rl_odds"
+        rl = row.get(rl_key)
+        if rl is None or (isinstance(rl, float) and pd.isna(rl)):
+            return "—"
+        sign = "+" if float(rl) > 0 else ""
+        return f"{t} {sign}{rl} ({_fmt_odds(row.get(rl_odds_key))})"
+
+    def _total_pick(row) -> str:
+        total = row.get("total_line")
+        if total is None or (isinstance(total, float) and pd.isna(total)):
+            return "N/A"
+        over_o  = _fmt_odds(row.get("over_odds"))
+        under_o = _fmt_odds(row.get("under_odds"))
+        proj = _proj_total_for(row, rpg)
+        if proj is not None:
+            return f"Over {total} ({over_o})" if proj >= float(total) else f"Under {total} ({under_o})"
+        return f"O/U {total}  ({over_o} / {under_o})"
+
+    filtered = filtered.copy()
+    filtered["_ml_pick"]    = filtered.apply(_ml_pick, axis=1)
+    filtered["_rl_pick"]    = filtered.apply(_rl_pick, axis=1)
+    filtered["_total_pick"] = filtered.apply(_total_pick, axis=1)
+
+    # ---- Edge summary table ----
     display_cols = {
-        "matchup": "Matchup",
-        "lineup_status": "Lineup",
-        "home_starter": "Home SP",
-        "away_starter": "Away SP",
-        "home_model_prob": "Home Model%",
-        "away_model_prob": "Away Model%",
-        "home_implied_prob": "Home Mkt%",
-        "away_implied_prob": "Away Mkt%",
-        "best_bet_side": "Bet Side",
-        "best_bet_edge": "Best Edge%",
-        "home_odds": "Home ML",
-        "away_odds": "Away ML",
-        "total_line": "Total",
-        "home_rl": "Home RL",
-        "away_rl": "Away RL",
+        "_ml_pick":         "ML Pick",
+        "_rl_pick":         "Run Line Pick",
+        "_total_pick":      "Game Total",
+        "matchup":          "Matchup",
+        "lineup_status":    "Lineup",
+        "home_starter":     "Home SP",
+        "away_starter":     "Away SP",
+        "home_model_prob":  "Home Model%",
+        "away_model_prob":  "Away Model%",
+        "home_implied_prob":"Home Mkt%",
+        "away_implied_prob":"Away Mkt%",
+        "best_bet_edge":    "Best Edge%",
+        "home_odds":        "Home ML",
+        "away_odds":        "Away ML",
     }
-    available = {k: v for k, v in display_cols.items() if k in filtered.columns}
+    available  = {k: v for k, v in display_cols.items() if k in filtered.columns}
     display_df = filtered[list(available.keys())].rename(columns=available)
     for col in ["Home Model%", "Away Model%", "Home Mkt%", "Away Mkt%"]:
         if col in display_df.columns:
@@ -303,7 +466,7 @@ def render(
 
     render_edge_table(display_df, edge_col="Best Edge%")
 
-    # ---- Bet recommendations — grouped by lineup status ----
+    # ---- Recommended Bets grouped by lineup status ----
     st.subheader("Recommended Bets")
 
     bets = filtered[filtered["best_bet_side"] != "PASS"].sort_values("best_bet_edge", ascending=False)
@@ -311,7 +474,7 @@ def render(
         st.info("No bets meet the minimum edge threshold today.")
         return
 
-    full_bets = bets[bets.get("lineup_status", pd.Series(dtype=str)) == "Full"] \
+    full_bets  = bets[bets.get("lineup_status", pd.Series(dtype=str)) == "Full"] \
         if "lineup_status" in bets.columns else pd.DataFrame()
     other_bets = bets[bets.get("lineup_status", pd.Series(dtype=str)) != "Full"] \
         if "lineup_status" in bets.columns else bets
@@ -319,20 +482,20 @@ def render(
     if not full_bets.empty:
         st.markdown(f'### {_STATUS_HTML["Full"]} &nbsp; Full Confidence — Both Starters Confirmed', unsafe_allow_html=True)
         st.caption("FIP, xFIP, and BABIP adjustments applied. Highest-confidence predictions.")
-        _render_bet_cards(full_bets, bankroll, team_stats, pitcher_stats)
+        _render_bet_cards(full_bets, bankroll, team_stats, pitcher_stats, rpg)
 
     if not other_bets.empty:
-        partial = other_bets[other_bets.get("lineup_status", pd.Series(dtype=str)) == "Partial"] \
+        partial   = other_bets[other_bets.get("lineup_status", pd.Series(dtype=str)) == "Partial"] \
             if "lineup_status" in other_bets.columns else pd.DataFrame()
         none_bets = other_bets[other_bets.get("lineup_status", pd.Series(dtype=str)) == "None"] \
             if "lineup_status" in other_bets.columns else other_bets
 
         if not partial.empty:
             st.markdown(f'### {_STATUS_HTML["Partial"]} &nbsp; Partial Lineup — One Starter Confirmed', unsafe_allow_html=True)
-            st.caption("FIP adjustment applied for confirmed starter only. Refresh when second starter is announced.")
-            _render_bet_cards(partial, bankroll, team_stats, pitcher_stats)
+            st.caption("FIP adjustment applied for confirmed starter only.")
+            _render_bet_cards(partial, bankroll, team_stats, pitcher_stats, rpg)
 
         if not none_bets.empty:
             st.markdown(f'### {_STATUS_HTML["None"]} &nbsp; No Lineup — Pythagorean Model Only', unsafe_allow_html=True)
             st.caption("No starters announced yet. Prediction based on season run differential only. Use with caution.")
-            _render_bet_cards(none_bets, bankroll, team_stats, pitcher_stats)
+            _render_bet_cards(none_bets, bankroll, team_stats, pitcher_stats, rpg)
