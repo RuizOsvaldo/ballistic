@@ -204,6 +204,81 @@ def get_today_lineups(date: datetime.date) -> pd.DataFrame:
     return cached(cache_key, fetch, ttl_hours=0.5)
 
 
+def get_live_games() -> pd.DataFrame:
+    """
+    Return any MLB games currently in progress with their current pitcher.
+
+    Returns DataFrame with columns:
+      game_pk, home_team, away_team, inning, inning_half,
+      home_current_pitcher, away_current_pitcher,
+      home_score, away_score, status
+    """
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    try:
+        resp = requests.get(
+            f"{MLB_API}/schedule",
+            params={"sportId": 1, "date": today, "hydrate": "linescore"},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for date_entry in data.get("dates", []):
+        for game in date_entry.get("games", []):
+            status = game.get("status", {}).get("abstractGameState", "")
+            if status != "Live":
+                continue
+            teams  = game.get("teams", {})
+            ls     = game.get("linescore", {})
+            gid    = game["gamePk"]
+            home   = teams.get("home", {}).get("team", {}).get("name", "")
+            away   = teams.get("away", {}).get("team", {}).get("name", "")
+            rows.append({
+                "game_pk":   gid,
+                "home_team": home,
+                "away_team": away,
+                "inning":    ls.get("currentInning"),
+                "inning_half": ls.get("inningHalf", ""),
+                "home_score": ls.get("teams", {}).get("home", {}).get("runs"),
+                "away_score": ls.get("teams", {}).get("away", {}).get("runs"),
+                "status":    status,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    live_df = pd.DataFrame(rows)
+
+    # Fetch current pitcher for each live game from the live feed
+    home_pitchers, away_pitchers = [], []
+    for _, row in live_df.iterrows():
+        try:
+            feed = requests.get(
+                f"https://statsapi.mlb.com/api/v1.1/game/{row['game_pk']}/feed/live",
+                timeout=TIMEOUT,
+            ).json()
+            box    = feed["liveData"]["boxscore"]["teams"]
+            def _current(side: str) -> str | None:
+                pitchers = box[side]["pitchers"]
+                if not pitchers:
+                    return None
+                players = box[side]["players"]
+                pid = pitchers[-1]
+                return players.get(f"ID{pid}", {}).get("person", {}).get("fullName")
+            home_pitchers.append(_current("home"))
+            away_pitchers.append(_current("away"))
+        except Exception:
+            home_pitchers.append(None)
+            away_pitchers.append(None)
+
+    live_df["home_current_pitcher"] = home_pitchers
+    live_df["away_current_pitcher"] = away_pitchers
+    return live_df
+
+
 def get_results_for_date_range(start: datetime.date, end: datetime.date) -> pd.DataFrame:
     """Fetch and combine results for a range of dates."""
     all_rows = []

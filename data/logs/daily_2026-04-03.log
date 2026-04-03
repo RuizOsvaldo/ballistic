@@ -1,0 +1,187 @@
+=== Ballistic Daily Run Fri Apr  3 08:06:26 PDT 2026 ===
+/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+[2026-04-03 08:06] Starting daily predictions job...
+  Loading game predictions...
+  ERROR loading games:
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 204, in _new_conn
+    sock = connection.create_connection(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/util/connection.py", line 60, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 1093, in _validate_conn
+    conn.connect()
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 759, in connect
+    self.sock = sock = self._new_conn()
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 211, in _new_conn
+    raise NameResolutionError(self.host, self, e) from e
+urllib3.exceptions.NameResolutionError: HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/adapters.py", line 644, in send
+    resp = conn.urlopen(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 535, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='api.the-odds-api.com', port=443): Max retries exceeded with url: /v4/sports/baseball_mlb/odds?apiKey=6d9fc0a975d4dfcf4296c1fd5868a331&regions=us&markets=h2h%2Cspreads%2Ctotals&oddsFormat=american (Caused by NameResolutionError("HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 453, in run
+    games_df = _load_games()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 60, in _load_games
+    raw_odds = get_mlb_odds()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 187, in get_mlb_odds
+    return cached("mlb_odds", fetch_todays, ttl_hours=2.0)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/cache.py", line 64, in cached
+    df = fetch_fn()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 180, in fetch_todays
+    df = _fetch_full_markets(SPORT_MLB)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 98, in _fetch_full_markets
+    resp = requests.get(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/adapters.py", line 677, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.the-odds-api.com', port=443): Max retries exceeded with url: /v4/sports/baseball_mlb/odds?apiKey=6d9fc0a975d4dfcf4296c1fd5868a331&regions=us&markets=h2h%2Cspreads%2Ctotals&oddsFormat=american (Caused by NameResolutionError("HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)"))
+
+  Loading batter props...
+Traceback (most recent call last):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 483, in <module>
+    run()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 473, in run
+    send_email(subject, html)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 438, in send_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 1045, in __init__
+    SMTP.__init__(self, host, port, local_hostname, timeout,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 255, in __init__
+    (code, msg) = self.connect(host, port)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 341, in connect
+    self.sock = self._get_socket(host, port, self.timeout)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 1051, in _get_socket
+    new_socket = super()._get_socket(host, port, timeout)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 312, in _get_socket
+    return socket.create_connection((host, port), timeout,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 822, in create_connection
+    for res in getaddrinfo(host, port, 0, SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+  ERROR loading props:
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 204, in _new_conn
+    sock = connection.create_connection(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/util/connection.py", line 60, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 1093, in _validate_conn
+    conn.connect()
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 759, in connect
+    self.sock = sock = self._new_conn()
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connection.py", line 211, in _new_conn
+    raise NameResolutionError(self.host, self, e) from e
+urllib3.exceptions.NameResolutionError: HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/adapters.py", line 644, in send
+    resp = conn.urlopen(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 535, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='api.the-odds-api.com', port=443): Max retries exceeded with url: /v4/sports/baseball_mlb/odds?apiKey=6d9fc0a975d4dfcf4296c1fd5868a331&regions=us&markets=h2h%2Cspreads%2Ctotals&oddsFormat=american (Caused by NameResolutionError("HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 461, in run
+    props_df = _load_batter_props()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 130, in _load_batter_props
+    games = get_mlb_odds()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 187, in get_mlb_odds
+    return cached("mlb_odds", fetch_todays, ttl_hours=2.0)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/cache.py", line 64, in cached
+    df = fetch_fn()
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 180, in fetch_todays
+    df = _fetch_full_markets(SPORT_MLB)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/data/odds.py", line 98, in _fetch_full_markets
+    resp = requests.get(
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/Users/osvaldoruiz/GitHub/ballistic/venv/lib/python3.9/site-packages/requests/adapters.py", line 677, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.the-odds-api.com', port=443): Max retries exceeded with url: /v4/sports/baseball_mlb/odds?apiKey=6d9fc0a975d4dfcf4296c1fd5868a331&regions=us&markets=h2h%2Cspreads%2Ctotals&oddsFormat=american (Caused by NameResolutionError("HTTPSConnection(host='api.the-odds-api.com', port=443): Failed to resolve 'api.the-odds-api.com' ([Errno 8] nodename nor servname provided, or not known)"))
+
+  Building email...
+  Sending to oruiz.code@gmail.com...
+  ERROR sending email:
+Traceback (most recent call last):
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 473, in run
+    send_email(subject, html)
+  File "/Users/osvaldoruiz/GitHub/ballistic/src/jobs/daily_predictions.py", line 438, in send_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 1045, in __init__
+    SMTP.__init__(self, host, port, local_hostname, timeout,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 255, in __init__
+    (code, msg) = self.connect(host, port)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 341, in connect
+    self.sock = self._get_socket(host, port, self.timeout)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 1051, in _get_socket
+    new_socket = super()._get_socket(host, port, timeout)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/smtplib.py", line 312, in _get_socket
+    return socket.create_connection((host, port), timeout,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 822, in create_connection
+    for res in getaddrinfo(host, port, 0, SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+=== FAILED Fri Apr  3 08:06:31 PDT 2026 — flag not set, will retry if run again ===

@@ -20,6 +20,7 @@ import traceback
 import unicodedata
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -86,7 +87,12 @@ def _load_games() -> pd.DataFrame:
 
     odds["lineup_status"] = odds.apply(_ls, axis=1)
 
-    games_with_prob = compute_win_probabilities(odds, team_stats, pitcher_stats)
+    from src.data.ballpark import get_bullpen_stats
+    try:
+        bullpen_stats = get_bullpen_stats(season)
+    except Exception:
+        bullpen_stats = pd.DataFrame()
+    games_with_prob = compute_win_probabilities(odds, team_stats, pitcher_stats, bullpen_df=bullpen_stats)
     ready = games_with_prob.dropna(subset=["home_model_prob", "away_model_prob"])
     if ready.empty:
         return pd.DataFrame()
@@ -155,7 +161,12 @@ def _load_batter_props() -> pd.DataFrame:
     if not projections:
         return pd.DataFrame()
 
-    proj_df = pd.DataFrame(projections).sort_values("proj_hits", ascending=False).head(10)
+    proj_df = (
+        pd.DataFrame(projections)
+        .drop_duplicates(subset="name")
+        .sort_values("proj_hits", ascending=False)
+        .head(10)
+    )
 
     # Merge with live prop lines
     props_df = pd.DataFrame()
@@ -173,8 +184,10 @@ def _load_batter_props() -> pd.DataFrame:
         return proj_df
 
     props_df["_norm"] = props_df["player_name"].apply(norm)
+    props_df = props_df.drop_duplicates(subset="_norm")
     proj_df["_norm"] = proj_df["name"].apply(norm)
     merged = proj_df.merge(props_df, on="_norm", how="left").drop(columns=["_norm"], errors="ignore")
+    merged = merged.drop_duplicates(subset="name")
 
     results = []
     for _, row in merged.iterrows():
@@ -275,23 +288,48 @@ def _build_html(games_df: pd.DataFrame, props_df: pd.DataFrame, today: datetime.
             lineup = row.get("lineup_status", "—")
             home_sp = row.get("home_starter") or "TBD"
             away_sp = row.get("away_starter") or "TBD"
+            commence = row.get("commence_time", "")
+            try:
+                game_dt = datetime.datetime.fromisoformat(str(commence).replace("Z", "+00:00"))
+                game_time = game_dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%-I:%M %p PT")
+            except Exception:
+                game_time = "—"
 
-            rec_html = (
-                f'<span class="bet">BET {bet_team} ({edge:+.1f}%)</span>'
-                if side != "PASS"
-                else '<span class="pass">PASS</span>'
-            )
             ec = _edge_class(edge)
+
+            # O/U recommendation from projected total
+            proj_total = row.get("proj_total")
+            if total is not None and proj_total is not None and not (isinstance(proj_total, float) and pd.isna(proj_total)):
+                if float(proj_total) >= float(total):
+                    ou_rec = f'<span class="bet">Over {total} ({over_o})</span>'
+                else:
+                    ou_rec = f'<span class="bet">Under {total} ({under_o})</span>'
+            else:
+                ou_rec = f'<span class="note">O/U {total if total else "N/A"} &nbsp; O {over_o} / U {under_o}</span>'
+
+            if side != "PASS":
+                bet_ml_odds = home_ml if side == "HOME" else away_ml
+                bet_rl_point = row.get("home_rl") if side == "HOME" else row.get("away_rl")
+                bet_rl_odds_val = row.get("home_rl_odds") if side == "HOME" else row.get("away_rl_odds")
+                rl_str = _fmt_rl(bet_rl_point, bet_rl_odds_val)
+
+                rec_html = (
+                    f'<span class="bet">ML: {bet_team} @ {bet_ml_odds} ({edge:+.1f}%)</span><br>'
+                    f'<span class="note">RL: {bet_team} {rl_str}</span><br>'
+                    f'{ou_rec}'
+                )
+            else:
+                rec_html = (
+                    f'<span class="pass">PASS</span><br>'
+                    f'{ou_rec}'
+                )
 
             rows_html.append(f"""
             <tr>
               <td>{rank}</td>
               <td><strong>{matchup}</strong><br>
-                  <span class="note">{away_sp} vs {home_sp} | Lineup: {lineup}</span></td>
+                  <span class="note">{away_sp} vs {home_sp} | Lineup: {lineup} | {game_time}</span></td>
               <td>{away_ml} / {home_ml}</td>
-              <td>{home_rl}<br><span class="note">{away_rl}</span></td>
-              <td>{total if total else 'N/A'}<br>
-                  <span class="note">O {over_o} / U {under_o}</span></td>
               <td class="{ec}">{home_prob:.1%} / {away_prob:.1%}</td>
               <td>{rec_html}</td>
             </tr>""")
@@ -301,8 +339,7 @@ def _build_html(games_df: pd.DataFrame, props_df: pd.DataFrame, today: datetime.
           <thead>
             <tr>
               <th>#</th><th>Matchup</th><th>Moneyline (Away/Home)</th>
-              <th>Run Line</th><th>Total (O/U)</th>
-              <th>Model % (H/A)</th><th>Recommendation</th>
+              <th>Model % (H/A)</th><th>Recommendation (ML · RL · O/U)</th>
             </tr>
           </thead>
           <tbody>{"".join(rows_html)}</tbody>

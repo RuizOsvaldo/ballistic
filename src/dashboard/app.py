@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.data.baseball_stats import get_pitcher_stats, get_team_stats
 from src.data.odds import get_mlb_odds
 from src.data.game_results import get_probable_starters
+from src.data.ballpark import get_bullpen_stats
 from src.models.kelly import compute_kelly_for_games
 from src.models.pythagorean import compute_pythagorean
 from src.models.regression_signals import compute_pitcher_signals, compute_team_signals
 from src.models.win_probability import compute_win_probabilities
+from src.data.bet_log_db import insert_bet, insert_parlay
 
 # ---------------------------------------------------------------------------
 # Page config — must be first Streamlit call
@@ -37,9 +39,13 @@ CURRENT_SEASON = datetime.datetime.now().year
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600 * 6, show_spinner="Loading team stats...")
-def load_team_stats(season: int) -> pd.DataFrame:
+def load_team_stats(season: int, _v: int = 2) -> pd.DataFrame:
+    """_v is a cache-bust version; increment when data source changes."""
     try:
         raw = get_team_stats(season)
+        if raw.empty:
+            st.error("Could not load team stats: no data returned from MLB Stats API.")
+            return pd.DataFrame()
         df = compute_pythagorean(raw)
         return compute_team_signals(df)
     except Exception as e:
@@ -54,6 +60,15 @@ def load_pitcher_stats(season: int) -> pd.DataFrame:
         return compute_pitcher_signals(raw)
     except Exception as e:
         st.error(f"Could not load pitcher stats: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600 * 6, show_spinner="Loading bullpen stats...")
+def load_bullpen_stats(season: int) -> pd.DataFrame:
+    try:
+        return get_bullpen_stats(season)
+    except Exception as e:
+        st.error(f"Could not load bullpen stats: {e}")
         return pd.DataFrame()
 
 
@@ -101,7 +116,12 @@ def load_games_data(team_stats: pd.DataFrame, pitcher_stats: pd.DataFrame, bankr
         odds_with_starters["lineup_status"] = odds_with_starters.apply(_lineup_status, axis=1)
 
         # Compute win probabilities (FIP adjustment applies only where starters are known)
-        games_with_prob = compute_win_probabilities(odds_with_starters, team_stats, pitcher_stats)
+        from src.data.ballpark import get_bullpen_stats as _get_bp
+        try:
+            bullpen = _get_bp(datetime.date.today().year)
+        except Exception:
+            bullpen = pd.DataFrame()
+        games_with_prob = compute_win_probabilities(odds_with_starters, team_stats, pitcher_stats, bullpen_df=bullpen)
 
         ready = games_with_prob.dropna(subset=["home_model_prob", "away_model_prob"])
         games_df = compute_kelly_for_games(ready, bankroll=bankroll)
@@ -123,6 +143,147 @@ def load_games_data(team_stats: pd.DataFrame, pitcher_stats: pd.DataFrame, bankr
 # ---------------------------------------------------------------------------
 # Page render functions
 # ---------------------------------------------------------------------------
+
+def _render_bet_slip_sidebar(bankroll: float) -> None:
+    """Render the bet slip in the sidebar."""
+    if "bet_slip" not in st.session_state:
+        st.session_state.bet_slip = []
+
+    slip = st.session_state.bet_slip
+    st.subheader("📋 Bet Slip")
+
+    if not slip:
+        st.caption("No bets added yet. Click **+ ML**, **+ RL**, or **+ O/U** on a game card.")
+        return
+
+    st.caption(f"{len(slip)} bet(s) selected")
+
+    to_remove = []
+    for i, bet in enumerate(slip):
+        col_desc, col_del = st.columns([5, 1])
+        with col_desc:
+            stake_val = st.number_input(
+                bet["description"],
+                min_value=1.0,
+                value=float(bet.get("stake", 50.0)),
+                step=5.0,
+                key=f"slip_stake_{bet['key']}",
+                label_visibility="visible",
+            )
+            slip[i]["stake"] = stake_val
+        with col_del:
+            st.write("")
+            if st.button("✕", key=f"slip_del_{bet['key']}"):
+                to_remove.append(i)
+
+    for idx in reversed(to_remove):
+        st.session_state.bet_slip.pop(idx)
+    if to_remove:
+        st.rerun()
+
+    # ── Parlay payout preview ──────────────────────────────────────
+    if len(slip) >= 2:
+        def _to_decimal(american: float) -> float:
+            if american is None or american == 0:
+                return 1.909  # -110 default
+            return (american / 100 + 1) if american > 0 else (100 / abs(american) + 1)
+
+        combined_decimal = 1.0
+        total_stake = slip[0].get("stake", 50.0)
+        for bet in slip:
+            combined_decimal *= _to_decimal(bet.get("line", -110))
+        payout = total_stake * combined_decimal
+        profit = payout - total_stake
+        st.markdown(
+            f"**Parlay odds:** +{int((combined_decimal - 1) * 100)}  "
+            f"| **Payout:** ${payout:,.2f}  |  **Profit:** ${profit:,.2f}",
+        )
+        st.caption(f"Based on ${total_stake:.0f} stake on first leg. Each leg uses its listed odds.")
+
+    st.divider()
+
+    import datetime as _dt
+    today_str = str(_dt.date.today())
+
+    log_col1, log_col2 = st.columns(2)
+
+    with log_col1:
+        if st.button("✅ Log as Singles", use_container_width=True):
+            for bet in slip:
+                insert_bet({
+                    "date":        today_str,
+                    "matchup":     bet["matchup"],
+                    "bet_side":    bet["description"],
+                    "line":        bet.get("line", 0),
+                    "stake":       bet.get("stake", 50.0),
+                    "edge_pct":    bet.get("edge_pct", 0),
+                    "model_prob":  bet.get("model_prob"),
+                    "signal_type": "Multiple",
+                    "outcome":     "Pending",
+                    "pnl":         0.0,
+                    "bet_type":    "Single",
+                })
+            st.session_state.bet_slip = []
+            st.success(f"Logged {len(slip)} single bet(s)!")
+            st.rerun()
+
+    with log_col2:
+        if st.button("🔗 Log as Parlay", use_container_width=True):
+            legs = [
+                {
+                    "date":        today_str,
+                    "matchup":     bet["matchup"],
+                    "bet_side":    bet["description"],
+                    "line":        bet.get("line", 0),
+                    "stake":       bet.get("stake", 50.0),
+                    "edge_pct":    bet.get("edge_pct", 0),
+                    "model_prob":  bet.get("model_prob"),
+                    "signal_type": "Multiple",
+                    "outcome":     "Pending",
+                    "pnl":         0.0,
+                }
+                for bet in slip
+            ]
+            insert_parlay(legs)
+            st.session_state.bet_slip = []
+            st.success(f"Logged {len(legs)}-leg parlay!")
+            st.rerun()
+
+    if st.button("🗑 Clear Slip", use_container_width=True):
+        st.session_state.bet_slip = []
+        st.rerun()
+
+
+def _render_game_analysis() -> None:
+    from src.dashboard.pages import game_analysis as ga_page
+    from src.data.ballpark import get_bullpen_stats as _get_bp
+    with st.sidebar:
+        st.title("🎯 Ballistic")
+        st.divider()
+        bankroll = st.number_input("Bankroll ($)", min_value=100, max_value=1_000_000, value=1_000, step=100)
+        st.divider()
+        _render_bet_slip_sidebar(bankroll)
+
+    team_stats_df   = load_team_stats(CURRENT_SEASON)
+    pitcher_stats_df = load_pitcher_stats(CURRENT_SEASON)
+    try:
+        bullpen_df = _get_bp(CURRENT_SEASON)
+    except Exception:
+        bullpen_df = pd.DataFrame()
+    games_df, _ = load_games_data(team_stats_df, pitcher_stats_df, bankroll)
+    ga_page.render(games_df, team_stats=team_stats_df, pitcher_stats=pitcher_stats_df, bullpen_df=bullpen_df)
+
+
+def _render_player_analysis() -> None:
+    from src.dashboard.pages import player_analysis as pa_page
+    with st.sidebar:
+        st.title("🎯 Ballistic")
+        st.divider()
+        bankroll = st.number_input("Bankroll ($)", min_value=100, max_value=1_000_000, value=1_000, step=100)
+        st.divider()
+        _render_bet_slip_sidebar(bankroll)
+    pa_page.render()
+
 
 def _render_home() -> None:
     from src.dashboard.pages import games as games_page
@@ -147,7 +308,7 @@ def _render_home() -> None:
             st.divider()
             section = st.selectbox(
                 "Section",
-                ["Games", "Teams", "Pitchers", "Player Props", "Preseason Projections"],
+                ["Games", "Teams", "Pitchers", "Player Props", "Preseason Projections", "Game Analysis", "Player Analysis"],
             )
             st.divider()
             st.subheader("Kelly Calculator")
@@ -164,6 +325,9 @@ def _render_home() -> None:
             st.cache_data.clear()
             st.rerun()
 
+        st.divider()
+        _render_bet_slip_sidebar(bankroll)
+
     if sport == "⚾ Baseball":
         team_stats_df = load_team_stats(CURRENT_SEASON)
         pitcher_stats_df = load_pitcher_stats(CURRENT_SEASON)
@@ -179,6 +343,18 @@ def _render_home() -> None:
             props_page.render()
         elif section == "Preseason Projections":
             preseason_page.render()
+        elif section == "Game Analysis":
+            from src.dashboard.pages import game_analysis as ga_page
+            from src.data.ballpark import get_bullpen_stats as _get_bp
+            try:
+                bullpen_df = _get_bp(CURRENT_SEASON)
+            except Exception:
+                bullpen_df = pd.DataFrame()
+            games_df, _ = load_games_data(team_stats_df, pitcher_stats_df, bankroll)
+            ga_page.render(games_df, team_stats=team_stats_df, pitcher_stats=pitcher_stats_df, bullpen_df=bullpen_df)
+        elif section == "Player Analysis":
+            from src.dashboard.pages import player_analysis as pa_page
+            pa_page.render()
 
     elif sport == "🏀 Basketball":
         basketball_page.render(bankroll=bankroll)

@@ -23,6 +23,8 @@ from src.models.player_props import (
     MIN_PROP_EDGE_PCT,
 )
 from src.shared.groq_agent import analyze_mlb_prop
+from src.dashboard.pages.games import _add_to_slip
+from src.data.game_results import get_live_games
 
 CURRENT_SEASON = datetime.datetime.now().year
 
@@ -457,9 +459,28 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
     pass_count = (bets_df["rec"] == "PASS").sum()
     st.caption(f"**{bet_count} BET** recommendations | **{pass_count} PASS** | Sorted: positive odds first, then edge")
 
+    # Build live pitcher lookup {team: current_pitcher} for mid-game context
+    live_pitcher: dict[str, str] = {}
+    try:
+        live_df = get_live_games()
+        if not live_df.empty:
+            for _, lg in live_df.iterrows():
+                if lg.get("home_current_pitcher"):
+                    live_pitcher[lg["home_team"]] = lg["home_current_pitcher"]
+                if lg.get("away_current_pitcher"):
+                    live_pitcher[lg["away_team"]] = lg["away_current_pitcher"]
+    except Exception:
+        pass
+
     for _, row in bets_df.iterrows():
         is_bet = row["rec"] == "BET"
         plus_tag = " ⭐ Positive Odds" if row["is_positive_odds"] else ""
+
+        # Determine who's currently pitching against this batter
+        batter_team = row.get("Team", "")
+        opp_team    = row.get("home_team") if batter_team == row.get("away_team") else row.get("away_team")
+        current_pitcher = live_pitcher.get(opp_team or "")
+
         label = (
             f"{'🟢 BET' if is_bet else '⚪ PASS'} — {row['name']}  |  "
             f"{row['direction']} {row['prop_line']}  |  "
@@ -478,31 +499,55 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
             st.caption(f"**{row['name']}** ({row['Team']}) — {matchup}")
             st.caption(f"BABIP: {row['babip']:.3f}  |  wRC+: {row.get('wrc_plus', 'N/A')}  |  Signal: {row['signal']}")
 
+            if current_pitcher:
+                st.info(
+                    f"🔴 **Live:** {opp_team} currently pitching **{current_pitcher}**.  "
+                    f"The pre-game prop line was set against the starter — "
+                    f"hit Refresh to recalculate if you want updated projection against {current_pitcher}.",
+                    icon=None,
+                )
+
             if row["is_positive_odds"]:
                 st.markdown(
                     f'<span style="background:#f39c12;color:#000;padding:3px 10px;border-radius:8px;font-weight:bold;font-size:13px">⭐ +ODDS VALUE — Win more than you risk</span>',
                     unsafe_allow_html=True,
                 )
 
-            if is_bet and st.button(f"AI Analysis", key=f"ai_hit_{row['name']}"):
-                with st.spinner("Analyzing..."):
-                    result = analyze_mlb_prop(
-                        player_name=row["name"],
-                        team=row["Team"],
-                        prop_type="Hits",
-                        line=row["prop_line"],
-                        model_projection=row["proj_hits"],
-                        edge_pct=row["edge_pct"],
-                        bet_direction=row["direction"],
-                        signals={
-                            "babip": row["babip"],
-                            "babip_deviation": round(row.get("babip_dev", 0), 3),
-                            "wrc_plus": row.get("wrc_plus"),
-                        },
-                    )
-                st.markdown(f"**Reasoning:** {result.get('reasoning', 'N/A')}")
-                st.markdown(f"**Confidence:** {result.get('confidence', 'N/A')}")
-                st.markdown(f"**Key Risk:** {result.get('key_risk', 'N/A')}")
+            btn_col1, btn_col2 = st.columns([1, 3])
+            with btn_col1:
+                slip_label = f"+ {row['direction']} {row['prop_line']} Hits — {row['name']}"
+                if st.button("📌 Add to Slip", key=f"slip_prop_{row['name']}"):
+                    _add_to_slip({
+                        "key": f"prop_hit_{row['name']}",
+                        "matchup": f"{row['away_team']} @ {row['home_team']}",
+                        "description": slip_label,
+                        "bet_type": "Prop",
+                        "line": float(row["odds"]),
+                        "edge_pct": row["edge_pct"],
+                        "model_prob": None,
+                        "stake": 50.0,
+                    })
+                    st.toast(f"Added: {slip_label}", icon="📌")
+            with btn_col2:
+                if is_bet and st.button("AI Analysis", key=f"ai_hit_{row['name']}"):
+                    with st.spinner("Analyzing..."):
+                        result = analyze_mlb_prop(
+                            player_name=row["name"],
+                            team=row["Team"],
+                            prop_type="Hits",
+                            line=row["prop_line"],
+                            model_projection=row["proj_hits"],
+                            edge_pct=row["edge_pct"],
+                            bet_direction=row["direction"],
+                            signals={
+                                "babip": row["babip"],
+                                "babip_deviation": round(row.get("babip_dev", 0), 3),
+                                "wrc_plus": row.get("wrc_plus"),
+                            },
+                        )
+                    st.markdown(f"**Reasoning:** {result.get('reasoning', 'N/A')}")
+                    st.markdown(f"**Confidence:** {result.get('confidence', 'N/A')}")
+                    st.markdown(f"**Key Risk:** {result.get('key_risk', 'N/A')}")
 
 
 def render() -> None:
