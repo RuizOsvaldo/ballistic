@@ -57,8 +57,8 @@ def get_games_for_date(date: datetime.date) -> pd.DataFrame:
     """
     date_str = date.strftime("%Y-%m-%d")
     cache_key = f"mlb_results_{date_str}"
-    # Only cache completed dates (not today — scores may still be coming in)
-    ttl = 24.0 if date < datetime.date.today() else 0.5
+    # Past dates: cache 24h (scores don't change). Today: cache 5 min so finalized games are caught quickly.
+    ttl = 24.0 if date < datetime.date.today() else 0.083
 
     def fetch() -> pd.DataFrame:
         url = f"{MLB_API}/schedule"
@@ -279,6 +279,147 @@ def get_live_games() -> pd.DataFrame:
     return live_df
 
 
+def get_live_game_state(game_pk: int) -> dict | None:
+    """
+    Fetch rich live state for a single in-progress game.
+
+    Returns dict with:
+      inning, inning_half, outs, balls, strikes,
+      home_score, away_score,
+      bases: {first, second, third}  — True if occupied
+      home_starter, away_starter,
+      home_pitcher: {name, pc, h, k, er, ip, is_starter}
+      away_pitcher: {name, pc, h, k, er, ip, is_starter}
+      pitching_side: 'home' | 'away'   (who is currently pitching)
+      batter: {name, summary}           (current batter)
+      on_deck: str | None
+    Returns None on any fetch failure.
+    """
+    try:
+        feed = requests.get(
+            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+            timeout=TIMEOUT,
+        ).json()
+        ld  = feed["liveData"]
+        ls  = ld["linescore"]
+        box = ld["boxscore"]["teams"]
+
+        offense = ls.get("offense", {})
+        defense = ls.get("defense", {})
+
+        # Inning half tells us who is pitching
+        inning_half = ls.get("inningHalf", "Top")
+        pitching_side  = "home" if inning_half.lower() == "top"  else "away"
+        batting_side   = "away" if pitching_side == "home" else "home"
+
+        def _pitcher_info(side: str) -> dict:
+            pitchers = box[side]["pitchers"]
+            players  = box[side]["players"]
+            if not pitchers:
+                return {}
+            starter_id  = pitchers[0]
+            current_id  = pitchers[-1]
+            p = players.get(f"ID{current_id}", {})
+            st = players.get(f"ID{starter_id}", {})
+            stats = p.get("stats", {}).get("pitching", {})
+            return {
+                "name":       p.get("person", {}).get("fullName", ""),
+                "starter":    st.get("person", {}).get("fullName", ""),
+                "is_starter": starter_id == current_id,
+                "pc":         stats.get("pitchesThrown", 0),
+                "h":          stats.get("hits", 0),
+                "k":          stats.get("strikeOuts", 0),
+                "er":         stats.get("earnedRuns", 0),
+                "ip":         stats.get("inningsPitched", "0.0"),
+            }
+
+        def _batter_info() -> dict:
+            batter_obj = offense.get("batter", {})
+            batter_id  = batter_obj.get("id")
+            name       = batter_obj.get("fullName", "")
+            summary    = ""
+            if batter_id:
+                for side in ("home", "away"):
+                    key = f"ID{batter_id}"
+                    if key in box[side]["players"]:
+                        summary = (box[side]["players"][key]
+                                   .get("stats", {}).get("batting", {})
+                                   .get("summary", ""))
+                        break
+            return {"name": name, "summary": summary}
+
+        gd      = feed.get("gameData", {})
+        weather = gd.get("weather", {})
+        venue   = gd.get("venue", {})
+        fi      = venue.get("fieldInfo", {})
+
+        def _team_hitting(side: str) -> dict:
+            ts = box[side].get("teamStats", {}).get("batting", {})
+            return {
+                "hits": ts.get("hits", 0),
+                "runs": ts.get("runs", 0),
+                "rbi":  ts.get("rbi", 0),
+            }
+
+        def _batter_info() -> dict:
+            batter_obj = offense.get("batter", {})
+            batter_id  = batter_obj.get("id")
+            name       = batter_obj.get("fullName", "")
+            stats: dict = {}
+            if batter_id:
+                for side in ("home", "away"):
+                    key = f"ID{batter_id}"
+                    if key in box[side]["players"]:
+                        bs = box[side]["players"][key].get("stats", {}).get("batting", {})
+                        stats = {
+                            "summary":  bs.get("summary", ""),
+                            "hits":     bs.get("hits", 0),
+                            "doubles":  bs.get("doubles", 0),
+                            "triples":  bs.get("triples", 0),
+                            "hr":       bs.get("homeRuns", 0),
+                            "rbi":      bs.get("rbi", 0),
+                            "runs":     bs.get("runs", 0),
+                            "k":        bs.get("strikeOuts", 0),
+                            "ab":       bs.get("atBats", 0),
+                        }
+                        break
+            return {"name": name, **stats}
+
+        return {
+            "inning":       ls.get("currentInning", "?"),
+            "inning_half":  inning_half,
+            "outs":         ls.get("outs", 0),
+            "balls":        ls.get("balls", 0),
+            "strikes":      ls.get("strikes", 0),
+            "home_score":   ls["teams"]["home"]["runs"],
+            "away_score":   ls["teams"]["away"]["runs"],
+            "home_hits":    ls["teams"]["home"].get("hits", 0),
+            "away_hits":    ls["teams"]["away"].get("hits", 0),
+            "home_team_batting": _team_hitting("home"),
+            "away_team_batting": _team_hitting("away"),
+            "bases": {
+                "first":  bool(offense.get("first")),
+                "second": bool(offense.get("second")),
+                "third":  bool(offense.get("third")),
+            },
+            "home_pitcher":  _pitcher_info("home"),
+            "away_pitcher":  _pitcher_info("away"),
+            "pitching_side": pitching_side,
+            "batting_side":  batting_side,
+            "batter":        _batter_info(),
+            "on_deck":       offense.get("onDeck", {}).get("fullName"),
+            "weather": {
+                "condition": weather.get("condition", ""),
+                "temp":      weather.get("temp", ""),
+                "wind":      weather.get("wind", ""),
+                "roof":      fi.get("roofType", ""),
+            },
+            "venue_name":    venue.get("name", ""),
+        }
+    except Exception:
+        return None
+
+
 def get_results_for_date_range(start: datetime.date, end: datetime.date) -> pd.DataFrame:
     """Fetch and combine results for a range of dates."""
     all_rows = []
@@ -342,13 +483,52 @@ def verify_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
         predicted_winner = pred_row["predicted_winner"]
         correct = int(predicted_winner in actual_winner or actual_winner in predicted_winner)
 
+        home_score = int(result_row["home_score"])
+        away_score = int(result_row["away_score"])
+        run_diff = home_score - away_score  # positive = home won
+
+        # ── Run line result (±1.5) ────────────────────────────────────────────
+        rl_side = pred_row.get("rl_side")
+        rl_correct: int | None = None
+        if rl_side == "HOME":
+            # Home -1.5: home must win by 2+
+            rl_correct = 1 if run_diff >= 2 else 0
+        elif rl_side == "AWAY":
+            # Away +1.5: away wins OR home wins by exactly 1
+            rl_correct = 1 if run_diff <= 1 else 0
+
+        # ── Game total result (O/U) ───────────────────────────────────────────
+        total_direction = pred_row.get("total_direction")
+        total_line = pred_row.get("total_line")
+        total_correct: int | None = None
+        if total_direction is not None and total_line is not None:
+            try:
+                actual_total = home_score + away_score
+                tl = float(total_line)
+                if total_direction == "OVER":
+                    total_correct = 1 if actual_total > tl else (None if actual_total == tl else 0)
+                elif total_direction == "UNDER":
+                    total_correct = 1 if actual_total < tl else (None if actual_total == tl else 0)
+            except (TypeError, ValueError):
+                pass
+
         df.at[idx, "actual_winner"] = actual_winner
         df.at[idx, "correct"] = correct
         df.at[idx, "verified_at"] = verified_at
+        if rl_correct is not None:
+            df.at[idx, "rl_correct"] = rl_correct
+        if total_correct is not None:
+            df.at[idx, "total_correct"] = total_correct
 
         # Persist to DB
         from src.data.predictions_db import update_result
-        update_result(game_date, home, away, actual_winner, bool(correct), verified_at)
+        update_result(
+            game_date, home, away, actual_winner, bool(correct), verified_at,
+            actual_home_score=home_score,
+            actual_away_score=away_score,
+            rl_correct=rl_correct,
+            total_correct=total_correct,
+        )
 
     df = df.drop(columns=["_date"], errors="ignore")
     return df

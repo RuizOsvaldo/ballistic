@@ -14,7 +14,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.data.baseball_stats import get_batter_stats, get_pitcher_stats
-from src.data.game_results import get_today_lineups
+from src.data.game_results import get_today_lineups, get_probable_starters, get_live_games
 from src.data.odds import get_mlb_odds, get_mlb_player_props, get_best_prop_lines, get_all_batter_hits_props
 from src.models.player_props import (
     project_pitcher_strikeouts,
@@ -24,7 +24,6 @@ from src.models.player_props import (
 )
 from src.shared.groq_agent import analyze_mlb_prop
 from src.dashboard.pages.games import _add_to_slip
-from src.data.game_results import get_live_games
 
 CURRENT_SEASON = datetime.datetime.now().year
 
@@ -68,6 +67,48 @@ def _normalize(name: str) -> str:
     return unicodedata.normalize("NFD", name).encode("ascii", "ignore").decode("ascii").lower().strip()
 
 
+def _hit_analysis(row: pd.Series, pitcher_df: pd.DataFrame) -> str:
+    """Generate a short data-driven explanation of the batter's hit probability."""
+    parts: list[str] = []
+
+    # BABIP regression signal
+    babip = row.get("babip", 0.300) or 0.300
+    if babip < 0.270:
+        parts.append(f"BABIP {babip:.3f} is below avg — due for positive regression")
+    elif babip > 0.330:
+        parts.append(f"BABIP {babip:.3f} is above avg — regression risk")
+    else:
+        parts.append(f"BABIP {babip:.3f} near league avg")
+
+    # Platoon advantage
+    bat_side = row.get("bat_side", "")
+    starter_hand = row.get("starter_hand", "")
+    if bat_side and starter_hand and starter_hand != "—":
+        if (bat_side == "L" and starter_hand == "R") or (bat_side == "R" and starter_hand == "L"):
+            parts.append(f"Platoon edge ({bat_side} bat vs {starter_hand}HP)")
+        elif bat_side == "S":
+            parts.append("Switch hitter — bats from advantageous side")
+        else:
+            parts.append(f"No platoon advantage ({bat_side} bat vs {starter_hand}HP)")
+
+    # Opposing starter quality
+    opp_starter = row.get("opp_starter", "")
+    if opp_starter and opp_starter != "TBD" and not pitcher_df.empty:
+        match = pitcher_df[pitcher_df["name"] == opp_starter]
+        if not match.empty:
+            p = match.iloc[0]
+            fip = p.get("fip")
+            pbabip = p.get("babip")
+            if fip and fip > 4.50:
+                parts.append(f"{opp_starter} FIP {fip:.2f} — hittable")
+            elif fip and fip < 3.50:
+                parts.append(f"{opp_starter} is elite (FIP {fip:.2f})")
+            if pbabip and pbabip > 0.310:
+                parts.append(f"Pitcher allows high BABIP ({pbabip:.3f})")
+
+    return " · ".join(parts) if parts else "—"
+
+
 @st.cache_data(ttl=3600 * 6, show_spinner="Loading pitcher stats...")
 def _load_pitchers(season: int) -> pd.DataFrame:
     try:
@@ -98,15 +139,19 @@ def _render_pitcher_props(pitcher_df: pd.DataFrame) -> None:
         return
 
     teams = ["All"] + sorted(pitcher_df["team"].dropna().unique().tolist())
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         team_filter = st.selectbox("Filter by team", teams, key="props_pitcher_team")
     with col2:
         min_edge = st.slider("Min edge %", 0.0, 30.0, MIN_PROP_EDGE_PCT, 1.0, key="props_pitcher_edge")
+    with col3:
+        pitcher_search = st.text_input("Search pitcher", placeholder="e.g. Cole", key="props_pitcher_search")
 
     filtered = pitcher_df.copy()
     if team_filter != "All":
         filtered = filtered[filtered["team"] == team_filter]
+    if pitcher_search.strip():
+        filtered = filtered[filtered["name"].str.contains(pitcher_search.strip(), case=False, na=False)]
 
     results = []
     for _, row in filtered.iterrows():
@@ -183,8 +228,8 @@ def _render_pitcher_props(pitcher_df: pd.DataFrame) -> None:
             return ""
 
         st.dataframe(
-            edge_df.style.applymap(_color, subset=["Signal"]),
-            use_container_width=True,
+            edge_df.style.map(_color, subset=["Signal"]),
+            width="stretch",
             hide_index=True,
         )
 
@@ -280,6 +325,7 @@ def _build_batter_projections(
             "proj_hits": proj_hits,
             "ab_per_game": round(ab_per_game, 1),
             "signal": signal,
+            "bat_side": row.get("bat_side", ""),
         })
 
     if not results:
@@ -295,7 +341,7 @@ def _build_batter_projections(
     return df.reset_index(drop=True)
 
 
-def _render_batter_props(batter_df: pd.DataFrame) -> None:
+def _render_batter_props(batter_df: pd.DataFrame, pitcher_df: pd.DataFrame) -> None:
     today = datetime.date.today()
 
     if batter_df.empty:
@@ -303,7 +349,7 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
         return
 
     # Load today's games (for team filtering and props fetching)
-    with st.spinner("Loading today's lineups and prop lines..."):
+    with st.spinner("Loading today's lineups, starters, and prop lines..."):
         try:
             games_df = get_mlb_odds()
         except Exception:
@@ -311,6 +357,11 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
 
         lineups_df = get_today_lineups(today)
         lineup_available = not lineups_df.empty
+
+        try:
+            starters_df = get_probable_starters(today)
+        except Exception:
+            starters_df = pd.DataFrame()
 
         props_df = pd.DataFrame()
         if not games_df.empty:
@@ -328,6 +379,21 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
     if lineup_available:
         lineup_names = set(lineups_df["player_name"].tolist())
 
+    # Build team → {opp_team, opp_starter} lookup from probable starters
+    team_to_matchup: dict[str, dict] = {}
+    if not starters_df.empty:
+        for _, sg in starters_df.iterrows():
+            home, away = sg["home_team"], sg["away_team"]
+            home_s = sg.get("home_starter") or "TBD"
+            away_s = sg.get("away_starter") or "TBD"
+            team_to_matchup[home] = {"opp_team": away, "opp_starter": away_s}
+            team_to_matchup[away] = {"opp_team": home, "opp_starter": home_s}
+
+    # Build pitcher name → pitch_hand lookup
+    pitcher_hand_map: dict[str, str] = {}
+    if not pitcher_df.empty and "pitch_hand" in pitcher_df.columns:
+        pitcher_hand_map = dict(zip(pitcher_df["name"], pitcher_df["pitch_hand"]))
+
     # Lineup status notice
     if lineup_available:
         n = len(lineup_names)
@@ -342,12 +408,54 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
         st.warning("No games found for today. Check your ODDS_API_KEY.")
         return
 
+    # ── Filters ───────────────────────────────────────────────────────────────
+    game_options = ["All Games"]
+    if not games_df.empty:
+        game_options += [
+            f"{row['away_team']} @ {row['home_team']}"
+            for _, row in games_df.iterrows()
+        ]
+
+    filt_col1, filt_col2 = st.columns(2)
+    with filt_col1:
+        game_filter = st.selectbox("Filter by game", game_options, key="props_batter_game")
+    with filt_col2:
+        player_search = st.text_input("Search player", placeholder="e.g. Judge", key="props_batter_search")
+
+    # Narrow today_teams to the selected game if filtered
+    filtered_teams = today_teams
+    if game_filter != "All Games":
+        away, home = game_filter.split(" @ ", 1)
+        filtered_teams = {away.strip(), home.strip()}
+
     # Build projections
-    proj_df = _build_batter_projections(batter_df, today_teams, lineup_names, lineup_available)
+    proj_df = _build_batter_projections(batter_df, filtered_teams, lineup_names, lineup_available)
 
     if proj_df.empty:
         st.info("No qualifying batters for today's games.")
         return
+
+    # Enrich projections with opponent, starter, pitcher hand, and hit analysis
+    def _enrich(row: pd.Series) -> pd.Series:
+        m = team_to_matchup.get(row["Team"], {})
+        opp_team = m.get("opp_team", "—")
+        opp_starter = m.get("opp_starter", "TBD")
+        starter_hand = pitcher_hand_map.get(opp_starter, "—") if opp_starter != "TBD" else "—"
+        row = row.copy()
+        row["opp_team"] = opp_team
+        row["opp_starter"] = opp_starter
+        row["starter_hand"] = starter_hand
+        return row
+
+    proj_df = proj_df.apply(_enrich, axis=1)
+    proj_df["hit_analysis"] = proj_df.apply(lambda r: _hit_analysis(r, pitcher_df), axis=1)
+
+    # Apply player search to projections
+    if player_search.strip():
+        proj_df = proj_df[proj_df["name"].str.contains(player_search.strip(), case=False, na=False)]
+        if proj_df.empty:
+            st.info(f"No results for '{player_search}'.")
+            return
 
     # ── Section 1: Top 10 Hitter Projections ──────────────────────────────────
     st.subheader("Top 10 Hitter Projections Today")
@@ -359,12 +467,18 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
     top10 = proj_df.head(10).copy()
     top10_display = top10.rename(columns={
         "name": "Batter",
+        "bat_side": "Bats",
         "babip": "BABIP",
         "wrc_plus": "wRC+",
         "proj_hits": "Proj Hits/G",
         "signal": "BABIP Signal",
         "ab_per_game": "AB/G",
-    })[["Batter", "Team", "BABIP", "wRC+", "AB/G", "Proj Hits/G", "BABIP Signal"]]
+        "opp_team": "Opp Team",
+        "opp_starter": "Opp Starter",
+        "starter_hand": "P Hand",
+        "hit_analysis": "Hit Analysis",
+    })[["Batter", "Bats", "Team", "Opp Team", "Opp Starter", "P Hand",
+        "BABIP", "AB/G", "Proj Hits/G", "BABIP Signal", "Hit Analysis"]]
 
     def _style_signal(val: str) -> str:
         if "High" in val:
@@ -374,8 +488,8 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
         return ""
 
     st.dataframe(
-        top10_display.style.applymap(_style_signal, subset=["BABIP Signal"]),
-        use_container_width=True,
+        top10_display.style.map(_style_signal, subset=["BABIP Signal"]),
+        width="stretch",
         hide_index=True,
     )
 
@@ -431,6 +545,10 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
         bet_rows.append({
             "name": row["name"],
             "Team": row.get("Team", ""),
+            "bat_side": row.get("bat_side", ""),
+            "opp_team": row.get("opp_team", "—"),
+            "opp_starter": row.get("opp_starter", "TBD"),
+            "starter_hand": row.get("starter_hand", "—"),
             "home_team": row.get("home_team", ""),
             "away_team": row.get("away_team", ""),
             "proj_hits": proj,
@@ -443,6 +561,7 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
             "babip_dev": row.get("babip_dev", 0),
             "wrc_plus": row.get("wrc_plus"),
             "signal": row.get("signal", ""),
+            "hit_analysis": row.get("hit_analysis", "—"),
             "is_positive_odds": is_positive,
             "rec": "BET" if edge["edge_pct"] >= MIN_PROP_EDGE_PCT else "PASS",
         })
@@ -454,6 +573,21 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
     bets_df = pd.DataFrame(bet_rows).sort_values(
         ["is_positive_odds", "edge_pct"], ascending=[False, False]
     )
+
+    # Apply game filter to bet recommendations
+    if game_filter != "All Games":
+        away_f, home_f = game_filter.split(" @ ", 1)
+        bets_df = bets_df[
+            (bets_df["away_team"] == away_f.strip()) & (bets_df["home_team"] == home_f.strip())
+        ]
+
+    # Apply player search to bet recommendations
+    if player_search.strip():
+        bets_df = bets_df[bets_df["name"].str.contains(player_search.strip(), case=False, na=False)]
+
+    if bets_df.empty:
+        st.info("No matching props for the selected filters.")
+        return
 
     bet_count = (bets_df["rec"] == "BET").sum()
     pass_count = (bets_df["rec"] == "PASS").sum()
@@ -472,64 +606,112 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
     except Exception:
         pass
 
-    for _, row in bets_df.iterrows():
-        is_bet = row["rec"] == "BET"
-        plus_tag = " ⭐ Positive Odds" if row["is_positive_odds"] else ""
+    # ── Checkbox table ────────────────────────────────────────────────────────
+    table_df = bets_df[["name", "Team", "bat_side", "opp_team", "opp_starter",
+                         "starter_hand", "away_team", "home_team", "direction",
+                         "prop_line", "odds_str", "edge_pct", "rec", "signal",
+                         "proj_hits", "babip", "babip_dev", "wrc_plus", "odds",
+                         "is_positive_odds", "hit_analysis"]].copy()
+    table_df.insert(0, "Select", False)
 
-        # Determine who's currently pitching against this batter
-        batter_team = row.get("Team", "")
-        opp_team    = row.get("home_team") if batter_team == row.get("away_team") else row.get("away_team")
-        current_pitcher = live_pitcher.get(opp_team or "")
+    display_df = table_df[["Select", "name", "bat_side", "Team", "opp_team",
+                            "opp_starter", "starter_hand", "direction", "prop_line",
+                            "odds_str", "edge_pct", "rec", "hit_analysis"]].rename(columns={
+        "name": "Batter",
+        "bat_side": "Bats",
+        "opp_team": "Opp Team",
+        "opp_starter": "Opp Starter",
+        "starter_hand": "P Hand",
+        "direction": "Bet",
+        "prop_line": "Line",
+        "odds_str": "Odds",
+        "edge_pct": "Edge %",
+        "rec": "Signal",
+        "hit_analysis": "Hit Analysis",
+    })
 
-        label = (
-            f"{'🟢 BET' if is_bet else '⚪ PASS'} — {row['name']}  |  "
-            f"{row['direction']} {row['prop_line']}  |  "
-            f"Odds: {row['odds_str']}{plus_tag}  |  "
-            f"Edge: {row['edge_pct']:+.1f}%"
-        )
+    edited_table = st.data_editor(
+        display_df,
+        column_config={
+            "Select": st.column_config.CheckboxColumn("Add to Slip", default=False, width="small"),
+            "Signal": st.column_config.TextColumn("Signal", width="small"),
+        },
+        disabled=[c for c in display_df.columns if c != "Select"],
+        hide_index=True,
+        width="stretch",
+    )
 
-        with st.expander(label, expanded=is_bet and row["is_positive_odds"]):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Model Proj", f"{row['proj_hits']:.2f} hits")
-            c2.metric("Sportsbook Line", f"{row['direction']} {row['prop_line']}")
-            c3.metric("Odds", row["odds_str"])
-            c4.metric("Edge", f"{row['edge_pct']:+.1f}%")
+    if st.button("📌 Add Selected to Slip", type="primary"):
+        selected_batters = edited_table[edited_table["Select"]]["Batter"].tolist()
+        added = 0
+        for batter_name in selected_batters:
+            match = table_df[table_df["name"] == batter_name]
+            if match.empty:
+                continue
+            row = match.iloc[0]
+            slip_label = f"{row['direction']} {row['prop_line']} Hits — {row['name']}"
+            _add_to_slip({
+                "key": f"prop_hit_{row['name']}",
+                "matchup": f"{row['away_team']} @ {row['home_team']}",
+                "description": slip_label,
+                "bet_type": "Prop",
+                "line": float(row["odds"]),
+                "edge_pct": row["edge_pct"],
+                "model_prob": None,
+                "stake": 50.0,
+            })
+            added += 1
+        if added:
+            st.toast(f"Added {added} prop(s) to slip", icon="📌")
+        else:
+            st.warning("No rows selected. Check the box in the 'Add to Slip' column first.")
 
-            matchup = f"{row['away_team']} @ {row['home_team']}"
-            st.caption(f"**{row['name']}** ({row['Team']}) — {matchup}")
-            st.caption(f"BABIP: {row['babip']:.3f}  |  wRC+: {row.get('wrc_plus', 'N/A')}  |  Signal: {row['signal']}")
+    st.divider()
 
-            if current_pitcher:
-                st.info(
-                    f"🔴 **Live:** {opp_team} currently pitching **{current_pitcher}**.  "
-                    f"The pre-game prop line was set against the starter — "
-                    f"hit Refresh to recalculate if you want updated projection against {current_pitcher}.",
-                    icon=None,
+    # ── AI Analysis expanders (BET rows only) ─────────────────────────────────
+    bet_rows_only = bets_df[bets_df["rec"] == "BET"]
+    if not bet_rows_only.empty:
+        st.subheader("AI Analysis — BET Props")
+        for _, row in bet_rows_only.iterrows():
+            plus_tag = " ⭐ Positive Odds" if row["is_positive_odds"] else ""
+            batter_team = row.get("Team", "")
+            opp_team = row.get("home_team") if batter_team == row.get("away_team") else row.get("away_team")
+            current_pitcher = live_pitcher.get(opp_team or "")
+
+            label = (
+                f"{row['name']}  |  {row['direction']} {row['prop_line']}  |  "
+                f"Odds: {row['odds_str']}{plus_tag}  |  Edge: {row['edge_pct']:+.1f}%"
+            )
+            with st.expander(label, expanded=False):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Model Proj", f"{row['proj_hits']:.2f} hits")
+                c2.metric("Sportsbook Line", f"{row['direction']} {row['prop_line']}")
+                c3.metric("Odds", row["odds_str"])
+                c4.metric("Edge", f"{row['edge_pct']:+.1f}%")
+
+                matchup = f"{row['away_team']} @ {row['home_team']}"
+                st.caption(
+                    f"**{row['name']}** ({row['Team']}) — Bats: {row.get('bat_side', '—')}  |  "
+                    f"vs **{row.get('opp_starter', 'TBD')}** ({row.get('opp_team', '—')}, "
+                    f"{row.get('starter_hand', '—')}HP)"
                 )
+                st.caption(f"BABIP: {row['babip']:.3f}  |  wRC+: {row.get('wrc_plus', 'N/A')}  |  {row.get('hit_analysis', '—')}")
 
-            if row["is_positive_odds"]:
-                st.markdown(
-                    f'<span style="background:#f39c12;color:#000;padding:3px 10px;border-radius:8px;font-weight:bold;font-size:13px">⭐ +ODDS VALUE — Win more than you risk</span>',
-                    unsafe_allow_html=True,
-                )
+                if current_pitcher:
+                    st.info(
+                        f"🔴 **Live:** {opp_team} currently pitching **{current_pitcher}**.  "
+                        f"The pre-game prop line was set against the starter — "
+                        f"hit Refresh to recalculate if you want an updated projection against {current_pitcher}.",
+                        icon=None,
+                    )
 
-            btn_col1, btn_col2 = st.columns([1, 3])
-            with btn_col1:
-                slip_label = f"+ {row['direction']} {row['prop_line']} Hits — {row['name']}"
-                if st.button("📌 Add to Slip", key=f"slip_prop_{row['name']}"):
-                    _add_to_slip({
-                        "key": f"prop_hit_{row['name']}",
-                        "matchup": f"{row['away_team']} @ {row['home_team']}",
-                        "description": slip_label,
-                        "bet_type": "Prop",
-                        "line": float(row["odds"]),
-                        "edge_pct": row["edge_pct"],
-                        "model_prob": None,
-                        "stake": 50.0,
-                    })
-                    st.toast(f"Added: {slip_label}", icon="📌")
-            with btn_col2:
-                if is_bet and st.button("AI Analysis", key=f"ai_hit_{row['name']}"):
+                if row["is_positive_odds"]:
+                    st.markdown(
+                        '<span style="background:#f39c12;color:#000;padding:3px 10px;border-radius:8px;font-weight:bold;font-size:13px">⭐ +ODDS VALUE — Win more than you risk</span>',
+                        unsafe_allow_html=True,
+                    )
+
+                if st.button("AI Analysis", key=f"ai_hit_{row['name']}"):
                     with st.spinner("Analyzing..."):
                         result = analyze_mlb_prop(
                             player_name=row["name"],
@@ -553,6 +735,7 @@ def _render_batter_props(batter_df: pd.DataFrame) -> None:
 def render() -> None:
     st.header("Player Props — MLB")
     st.caption(
+        f"**{datetime.date.today().strftime('%A, %B %-d, %Y')}**  ·  "
         "Stat-model projections for pitcher and batter props. "
         "Find value where sportsbook lines diverge from underlying performance metrics."
     )
@@ -566,4 +749,4 @@ def render() -> None:
         _render_pitcher_props(pitcher_df)
 
     with tab2:
-        _render_batter_props(batter_df)
+        _render_batter_props(batter_df, pitcher_df)

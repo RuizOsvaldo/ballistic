@@ -44,17 +44,17 @@ pybaseball (FanGraphs/BBRef)          The Odds API
 | Module | Responsibility |
 |---|---|
 | `cache.py` | Disk-backed parquet cache with configurable TTL. All expensive I/O goes through `cached()`. |
-| `baseball_stats.py` | pybaseball wrappers: team stats (batting, pitching, records), pitcher stats (FIP, xFIP, SIERA, BABIP, K%, whiff%), batter stats (wRC+, BABIP, barrel%, exit velocity) |
+| `baseball_stats.py` | Team stats via MLB Stats API (team batting, pitching, records — joined on `team_id`). Individual pitcher/batter stats via pybaseball FanGraphs leaderboards (FIP, xFIP, SIERA, BABIP, K%, whiff%, wRC+, barrel%, exit velocity). FanGraphs returns 403 for team endpoints — MLB Stats API used instead. |
 | `odds.py` | Odds API client: moneylines (h2h), game totals, player props. Sport-agnostic helpers for MLB now; NBA/NFL planned. |
 
 ### `src/models/`
 
 | Module | Responsibility |
 |---|---|
-| `pythagorean.py` | `compute_pythagorean(df)` — adds pyth_win_pct, pyth_deviation, pyth_signal |
+| `pythagorean.py` | `pythagorean_win_pct(rs, ra)` — RS^1.83 / (RS^1.83 + RA^1.83) (Pythagenpat exponent). `log5_probability(a, b)` — Bill James head-to-head matchup probability. `regress_rs_ra(rs, ra, g, league_rs, league_ra)` — shrinkage blend weight = G/(G+30), activates at 20 games. `compute_pythagorean(df)` — adds pyth_win_pct, pyth_deviation, pyth_signal. |
 | `regression_signals.py` | `compute_pitcher_signals(df)` and `compute_team_signals(df)` — FIP-ERA gap, BABIP deviation severity |
-| `win_probability.py` | `compute_win_probabilities(games, teams, pitchers)` — Pythagorean base + FIP adj + home field |
-| `kelly.py` | `compute_kelly(model_prob, odds)` and `compute_kelly_for_games(df)` — half-Kelly bet sizing |
+| `win_probability.py` | `compute_win_probabilities(games, teams, pitchers)` — full Peta + sabermetrics pipeline: Log5 base, regression to mean, lineup quality matchup FIP adjustment, home field, bullpen adj, vig-free edge. `get_formula_state(team_stats_df)` — returns EARLY_SEASON or REGRESSION_ACTIVE based on games played per team. `lineup_matchup_fip_adjustment(lineup_df, batter_stats_df, team)` — OPS-based effective FIP adjustment. |
+| `kelly.py` | `compute_kelly(model_prob, odds, opponent_odds)` — half-Kelly with vig-free implied probability when opponent odds are provided. `compute_kelly_for_games(df)` — batch bet sizing. |
 | `player_props.py` | Pitcher K projections, batter hit/total base/HR projections, prop edge calculation |
 | `preseason.py` | `compute_preseason_projections(prior_stats, vegas_lines)` — Peta methodology win total projections |
 
@@ -92,26 +92,56 @@ pybaseball (FanGraphs/BBRef)          The Odds API
 
 ## Win Probability Model
 
+Full Peta + sabermetrics pipeline (Sprint 11):
+
 ```
-base_prob          = team_pythagorean_win_pct
-pitcher_adj        = (league_avg_fip - starter_fip) * 0.03   # ~3% per FIP point
-home_field_adj     = +0.04 if home else 0.0
-win_prob           = clamp(base_prob + pitcher_adj + home_field_adj, 0.05, 0.95)
+Step 1:  Pythagorean W% per team — RS^1.83 / (RS^1.83 + RA^1.83)
+         If team has >= 20 games: RS/RA blended with league mean
+           weight = G / (G + 30)
+           league avg RS/G and RA/G derived live from team_stats_df (not hardcoded)
+         If team has < 20 games: raw RS/RA used (no shrinkage)
+
+Step 2:  Log5 head-to-head probability (Bill James)
+           P = (A - A*B) / (A + B - 2*A*B)
+         Replaces the old normalize(home_pyth + away_pyth) approach.
+         Two equal teams always produce exactly 0.5.
+
+Step 3:  Starting pitcher FIP adjustment
+           effective_fip = starter_fip + lineup_matchup_adj
+           lineup_matchup_adj = (lineup_avg_ops - 0.720) * 3.0
+           pitch_adj = (league_avg_fip - effective_fip) * 0.03
+         League avg FIP is IP-weighted mean of all qualified starters.
+         OPS used as lineup quality proxy (wOBA unavailable from MLB Stats API; r≈0.97).
+         Graceful no-op when lineup not posted.
+
+Step 4:  Home field advantage: +0.04
+
+Step 5:  Bullpen FIP adjustment
+           bullpen_adj = (opp_bullpen_fip - league_avg_bullpen_fip) * (3/9) * 0.30
+
+Step 6:  Renormalize both sides to sum to 1.0, then clamp [0.30, 0.70]
 ```
 
-League average FIP is computed dynamically as IP-weighted mean of all qualified starters.
+**Seasonal formula state** is auto-detected on every page load via `get_formula_state(team_stats_df)`:
+- `EARLY_SEASON` — any team has < 20 games played → blue info banner
+- `REGRESSION_ACTIVE` — all teams have ≥ 20 games played → green success banner
 
 ---
 
 ## Edge & Kelly Calculation
 
 ```
-implied_prob       = vig-removed probability from odds.py
+# Vig-free implied probability (Sprint 11)
+raw_home           = 1 / decimal_odds(home_american_odds)
+raw_away           = 1 / decimal_odds(away_american_odds)
+implied_prob       = raw_home / (raw_home + raw_away)   # vig removed
+
 edge               = win_prob - implied_prob
-# Bets flagged when edge > 3% (configurable MIN_EDGE in kelly.py)
+# Bets flagged when edge >= 3%
 
 kelly_fraction     = (b * p - q) / b    # b = decimal odds - 1
 stake_pct          = kelly_fraction * 0.5  # half-Kelly
+stake_pct          = min(stake_pct, 0.05)  # hard cap 5% of bankroll
 dollar_stake       = bankroll * stake_pct
 ```
 
@@ -120,7 +150,7 @@ dollar_stake       = bankroll * stake_pct
 ## Preseason Win Projection Model
 
 ```
-pyth_pct           = RS² / (RS² + RA²)  [prior season]
+pyth_pct           = RS^1.83 / (RS^1.83 + RA^1.83)  [prior season]
 regressed_pct      = pyth_pct * 0.80 + 0.500 * 0.20  [regression to mean]
 war_win_adj        = net_war_change      [roster moves]
 projected_wins     = regressed_pct * 162 + war_win_adj
@@ -149,12 +179,12 @@ Each uses a tailored system prompt focused on that bet type.
 
 | Data | TTL | Notes |
 |---|---|---|
-| Team stats (pybaseball) | 24 hours | Refreshed once per day at first request |
-| Pitcher stats (pybaseball) | 24 hours | Same |
-| Batter stats (pybaseball) | 24 hours | Same |
-| Odds (moneyline) | 1 hour | More frequent — lines move |
-| Player props | 1 hour | Per game_id, sparse refresh |
-| Streamlit layer | 6 hours (stats), 1 hour (odds) | Additional Streamlit `@st.cache_data` on top |
+| Team / pitcher / batter stats | 6 hours | MLB Stats API + pybaseball leaderboards |
+| Odds (moneyline, run line, totals) | 2 hours | Lines move — shorter TTL |
+| Player props | 2 hours | Per game_id, sparse refresh |
+| Bullpen stats | 6 hours | pybaseball |
+| Starters / lineups | 1 hour | Posted closer to game time |
+| Completed game results (past dates) | 24 hours | Immutable once final |
 
 Cache files stored at `data/cache/*.parquet`.
 

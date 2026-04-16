@@ -12,9 +12,9 @@ The approach is not about picking winners. It is about finding **positive expect
 
 | Sport | Status | Primary Bet Types |
 |---|---|---|
-| Baseball (MLB) | Active — Sprints 1-4 | Moneylines, totals, run lines, player props, preseason win totals |
-| Basketball (NBA) | Planned — Sprints 5-6 | Spreads, moneylines, totals, player props (PRA, pts, reb, ast) |
-| Football (NFL) | Planned — Sprints 7-8 | Spreads, moneylines, totals, player props (pass yds, rush yds, TDs) |
+| Baseball (MLB) | Active — Sprints 1-11 | Moneylines, totals, run lines, player props, preseason win totals |
+| Basketball (NBA) | Planned — Sprints 12+ | Spreads, moneylines, totals, player props (PRA, pts, reb, ast) |
+| Football (NFL) | Planned — Sprints 12+ | Spreads, moneylines, totals, player props (pass yds, rush yds, TDs) |
 
 Each sport has its own analytical framework, stat models, data sources, and documentation. They share a common dashboard shell, odds client, bet sizing engine, and AI reasoning agent.
 
@@ -170,8 +170,15 @@ MLB_Analysis/
 | Sprint | Focus | Status |
 |---|---|---|
 | 1 | Foundation: structure, security, data ingestion, odds client | Complete |
-| 2 | Baseball models, player props model, Groq agent, preseason projections | In progress |
-| 3 | Baseball dashboard: all pages including props and AI recommendations | Pending |
-| 4 | Polish: history tracker, tests, final docs, sport stubs | Pending |
-| 5-6 | Basketball — separate planning session | Planned |
-| 7-8 | Football — separate planning session | Planned |
+| 2 | Baseball models, player props model, Groq agent, preseason projections | Complete |
+| 3 | Baseball dashboard: all pages including props and AI recommendations | Complete |
+| 4 | Polish: history tracker, tests, final docs, sport stubs | Complete |
+| 5 | FanGraphs 403 fix (MLB Stats API), Game Analysis page, Player Analysis page | Complete |
+| 6 | Bet slip, bullpen + park factors wired into win probability, live game feed | Complete |
+| 7 | Bet log (SQLite), model calibration tracking, daily email predictions | Complete |
+| 8 | Prediction tracking (SQLite), result verification job, ROI analytics | Complete |
+| 9 | FanGraphs 403 fix, Game Analysis page, Player Analysis page, bet slip, bullpen + park factors, live game feed | Complete |
+| 10 | Poisson run-line and game-total edge (±1.5 RL, O/U) | Complete |
+| 11 | Log5 head-to-head probability, RS/RA regression to mean (auto 20-game switch), lineup quality matchup FIP adjustment, vig-free implied probability, Pythagorean exponent 1.83, in-app seasonal formula state banner | Complete |
+| 12+ | Basketball (NBA) — separate planning session | Planned |
+| 13+ | Football (NFL) — separate planning session | Planned |

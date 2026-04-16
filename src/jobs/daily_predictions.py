@@ -100,115 +100,6 @@ def _load_games() -> pd.DataFrame:
     return compute_kelly_for_games(ready, bankroll=1000)
 
 
-def _load_batter_props() -> pd.DataFrame:
-    from src.data.baseball_stats import get_batter_stats
-    from src.data.game_results import get_today_lineups
-    from src.data.odds import get_mlb_odds, get_all_batter_hits_props
-    from src.models.player_props import project_batter_hits, compute_prop_edge, MIN_PROP_EDGE_PCT
-
-    _FG_TEAM_MAP = {
-        "ARI": "Arizona Diamondbacks", "ATH": "Athletics", "ATL": "Atlanta Braves",
-        "BAL": "Baltimore Orioles", "BOS": "Boston Red Sox", "CHC": "Chicago Cubs",
-        "CHW": "Chicago White Sox", "CIN": "Cincinnati Reds", "CLE": "Cleveland Guardians",
-        "COL": "Colorado Rockies", "DET": "Detroit Tigers", "HOU": "Houston Astros",
-        "KCR": "Kansas City Royals", "LAA": "Los Angeles Angels", "LAD": "Los Angeles Dodgers",
-        "MIA": "Miami Marlins", "MIL": "Milwaukee Brewers", "MIN": "Minnesota Twins",
-        "NYM": "New York Mets", "NYY": "New York Yankees", "PHI": "Philadelphia Phillies",
-        "PIT": "Pittsburgh Pirates", "SDP": "San Diego Padres", "SEA": "Seattle Mariners",
-        "SFG": "San Francisco Giants", "STL": "St. Louis Cardinals", "TBR": "Tampa Bay Rays",
-        "TEX": "Texas Rangers", "TOR": "Toronto Blue Jays", "WSN": "Washington Nationals",
-    }
-
-    def norm(s: str) -> str:
-        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
-
-    today = datetime.date.today()
-    season = today.year
-
-    batters = get_batter_stats(season, min_pa=10)
-    lineups = get_today_lineups(today)
-    games = get_mlb_odds()
-
-    today_teams = set(games["home_team"].tolist() + games["away_team"].tolist())
-    today_teams_norm = {norm(t) for t in today_teams}
-    lineup_norm = {norm(n) for n in lineups["player_name"].tolist()} if not lineups.empty else set()
-    lineup_available = bool(lineup_norm)
-
-    projections = []
-    for _, row in batters.iterrows():
-        if pd.isna(row.get("babip")) or pd.isna(row.get("k_pct")):
-            continue
-        full_team = _FG_TEAM_MAP.get(row.get("team", ""), row.get("team", ""))
-        if norm(full_team) not in today_teams_norm:
-            continue
-        name = row.get("name", "")
-        if lineup_available and norm(name) not in lineup_norm:
-            continue
-        pa = row.get("pa", 0) or 0
-        ab = row.get("ab", 0) or 0
-        est_games = max(pa / 4.5, 1)
-        ab_per_game = ab / est_games if pa > 0 else 3.5
-        proj = project_batter_hits(row["babip"], ab_per_game, row["k_pct"])
-        projections.append({
-            "name": name,
-            "team": full_team,
-            "proj_hits": proj,
-            "babip": round(row["babip"], 3),
-            "wrc_plus": row.get("wrc_plus"),
-            "k_pct": row.get("k_pct"),
-        })
-
-    if not projections:
-        return pd.DataFrame()
-
-    proj_df = (
-        pd.DataFrame(projections)
-        .drop_duplicates(subset="name")
-        .sort_values("proj_hits", ascending=False)
-        .head(10)
-    )
-
-    # Merge with live prop lines
-    props_df = pd.DataFrame()
-    if not games.empty:
-        try:
-            props_df = get_all_batter_hits_props(games)
-        except Exception:
-            pass
-
-    if props_df.empty:
-        proj_df["prop_line"] = None
-        proj_df["over_odds"] = None
-        proj_df["under_odds"] = None
-        proj_df["rec"] = "No line"
-        return proj_df
-
-    props_df["_norm"] = props_df["player_name"].apply(norm)
-    props_df = props_df.drop_duplicates(subset="_norm")
-    proj_df["_norm"] = proj_df["name"].apply(norm)
-    merged = proj_df.merge(props_df, on="_norm", how="left").drop(columns=["_norm"], errors="ignore")
-    merged = merged.drop_duplicates(subset="name")
-
-    results = []
-    for _, row in merged.iterrows():
-        line = row.get("prop_line")
-        proj = row["proj_hits"]
-        if pd.isna(line) if isinstance(line, float) else line is None:
-            row = row.copy()
-            row["rec"] = "No line yet"
-            row["direction"] = "—"
-            results.append(row)
-            continue
-        direction = "OVER" if proj > line else "UNDER"
-        edge = compute_prop_edge(proj, float(line), direction)
-        row = row.copy()
-        row["direction"] = direction
-        row["rec"] = "BET ✅" if edge["edge_pct"] >= MIN_PROP_EDGE_PCT else "PASS"
-        results.append(row)
-
-    return pd.DataFrame(results) if results else proj_df
-
-
 # ---------------------------------------------------------------------------
 # HTML email builder
 # ---------------------------------------------------------------------------
@@ -254,150 +145,78 @@ def _edge_class(edge: float) -> str:
     return "low"
 
 
-def _build_html(games_df: pd.DataFrame, props_df: pd.DataFrame, today: datetime.date) -> str:
+def _build_html(games_df: pd.DataFrame, today: datetime.date) -> str:
     date_str = today.strftime("%A, %B %-d, %Y")
     sections: list[str] = []
 
-    # ── Game Predictions ──────────────────────────────────────────────────
-    sections.append(f"<h2>⚾ Top Game Predictions</h2>")
+    # ── Top 10 Bets by Edge ───────────────────────────────────────────────
+    sections.append("<h2>🎯 Top 10 Bets to Place</h2>")
 
-    if games_df.empty:
-        sections.append("<p>No games loaded today — check ODDS_API_KEY.</p>")
-    else:
-        bets = games_df[games_df["best_bet_side"] != "PASS"].sort_values("best_bet_edge", ascending=False).head(10)
-        all_games = games_df.sort_values("best_bet_edge", ascending=False).head(10)
-        display = bets if not bets.empty else all_games
+    all_bets = []
 
-        rows_html = []
-        for rank, (_, row) in enumerate(display.iterrows(), 1):
-            side = row.get("best_bet_side", "PASS")
-            edge = row.get("best_bet_edge", 0)
-            home = row.get("home_team", "?")
-            away = row.get("away_team", "?")
-            matchup = f"{away} @ {home}"
-            bet_team = home if side == "HOME" else away if side in ("HOME", "AWAY") else "—"
-            home_prob = row.get("home_model_prob", 0)
-            away_prob = row.get("away_model_prob", 0)
-            home_ml = _fmt_odds(row.get("home_odds"))
-            away_ml = _fmt_odds(row.get("away_odds"))
-            total = row.get("total_line")
-            over_o = _fmt_odds(row.get("over_odds"))
-            under_o = _fmt_odds(row.get("under_odds"))
-            home_rl = _fmt_rl(row.get("home_rl"), row.get("home_rl_odds"))
-            away_rl = _fmt_rl(row.get("away_rl"), row.get("away_rl_odds"))
-            lineup = row.get("lineup_status", "—")
-            home_sp = row.get("home_starter") or "TBD"
-            away_sp = row.get("away_starter") or "TBD"
-            commence = row.get("commence_time", "")
-            try:
-                game_dt = datetime.datetime.fromisoformat(str(commence).replace("Z", "+00:00"))
-                game_time = game_dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%-I:%M %p PT")
-            except Exception:
-                game_time = "—"
+    # Collect ML bets
+    ml_bets = games_df[games_df["best_bet_side"] != "PASS"].copy()
+    for _, row in ml_bets.iterrows():
+        team = row["home_team"] if row["best_bet_side"] == "HOME" else row["away_team"]
+        all_bets.append({
+            "matchup": f"{row['away_team']} @ {row['home_team']}",
+            "bet": f"{team} (ML)",
+            "edge": row.get("best_bet_edge", 0),
+            "type": "ML",
+        })
 
+    # Collect RL bets
+    rl_bets = games_df[games_df["best_rl_side"] != "PASS"].copy() if "best_rl_side" in games_df.columns else pd.DataFrame()
+    for _, row in rl_bets.iterrows():
+        team = row["home_team"] if row["best_rl_side"] == "HOME" else row["away_team"]
+        if row["best_rl_side"] == "HOME":
+            rl_val = float(row['home_rl'])
+        else:
+            rl_val = float(row['away_rl'])
+        side_str = f"+{rl_val:.1f}" if rl_val > 0 else f"{rl_val:.1f}"
+        all_bets.append({
+            "matchup": f"{row['away_team']} @ {row['home_team']}",
+            "bet": f"{team} (RL {side_str})",
+            "edge": row.get("best_rl_edge_pct", 0) or 0,
+            "type": "RL",
+        })
+
+    # Collect O/U bets
+    ou_bets = games_df[games_df["best_total_direction"].notna()].copy() if "best_total_direction" in games_df.columns else pd.DataFrame()
+    for _, row in ou_bets.iterrows():
+        direction = row.get("best_total_direction", "?")
+        all_bets.append({
+            "matchup": f"{row['away_team']} @ {row['home_team']}",
+            "bet": f"{direction} (O/U {row.get('total_line', '?')})",
+            "edge": row.get("best_total_edge_pct", 0) or 0,
+            "type": "O/U",
+        })
+
+    if all_bets:
+        bets_df = pd.DataFrame(all_bets).sort_values("edge", ascending=False).head(10)
+        bet_rows = []
+        for rank, (_, row) in enumerate(bets_df.iterrows(), 1):
+            edge = row["edge"]
             ec = _edge_class(edge)
-
-            # O/U recommendation from projected total
-            proj_total = row.get("proj_total")
-            if total is not None and proj_total is not None and not (isinstance(proj_total, float) and pd.isna(proj_total)):
-                if float(proj_total) >= float(total):
-                    ou_rec = f'<span class="bet">Over {total} ({over_o})</span>'
-                else:
-                    ou_rec = f'<span class="bet">Under {total} ({under_o})</span>'
-            else:
-                ou_rec = f'<span class="note">O/U {total if total else "N/A"} &nbsp; O {over_o} / U {under_o}</span>'
-
-            if side != "PASS":
-                bet_ml_odds = home_ml if side == "HOME" else away_ml
-                bet_rl_point = row.get("home_rl") if side == "HOME" else row.get("away_rl")
-                bet_rl_odds_val = row.get("home_rl_odds") if side == "HOME" else row.get("away_rl_odds")
-                rl_str = _fmt_rl(bet_rl_point, bet_rl_odds_val)
-
-                rec_html = (
-                    f'<span class="bet">ML: {bet_team} @ {bet_ml_odds} ({edge:+.1f}%)</span><br>'
-                    f'<span class="note">RL: {bet_team} {rl_str}</span><br>'
-                    f'{ou_rec}'
-                )
-            else:
-                rec_html = (
-                    f'<span class="pass">PASS</span><br>'
-                    f'{ou_rec}'
-                )
-
-            rows_html.append(f"""
+            bet_rows.append(f"""
             <tr>
               <td>{rank}</td>
-              <td><strong>{matchup}</strong><br>
-                  <span class="note">{away_sp} vs {home_sp} | Lineup: {lineup} | {game_time}</span></td>
-              <td>{away_ml} / {home_ml}</td>
-              <td class="{ec}">{home_prob:.1%} / {away_prob:.1%}</td>
-              <td>{rec_html}</td>
+              <td><strong>{row['matchup']}</strong></td>
+              <td>{row['bet']}</td>
+              <td class="{ec}">{edge:+.1f}%</td>
             </tr>""")
 
         sections.append(f"""
         <table>
           <thead>
             <tr>
-              <th>#</th><th>Matchup</th><th>Moneyline (Away/Home)</th>
-              <th>Model % (H/A)</th><th>Recommendation (ML · RL · O/U)</th>
+              <th>#</th><th>Matchup</th><th>Bet</th><th>Edge</th>
             </tr>
           </thead>
-          <tbody>{"".join(rows_html)}</tbody>
+          <tbody>{"".join(bet_rows)}</tbody>
         </table>""")
-
-        if bets.empty:
-            sections.append('<p class="note">No games cleared the 3% edge threshold today — all shown for reference.</p>')
-
-    # ── Player Props ──────────────────────────────────────────────────────
-    sections.append("<h2>🏏 Top 10 Batter Hit Projections</h2>")
-
-    if props_df.empty:
-        sections.append("<p>No batter data available.</p>")
     else:
-        prop_rows = []
-        for rank, (_, row) in enumerate(props_df.head(10).iterrows(), 1):
-            name = row.get("name", "?")
-            team = row.get("team", "?")
-            proj = row.get("proj_hits", 0)
-            babip = row.get("babip", 0)
-            wrc = row.get("wrc_plus", "N/A")
-            line = row.get("prop_line")
-            direction = row.get("direction", "—")
-            rec = row.get("rec", "No line yet")
-            over_o = _fmt_odds(row.get("over_odds"))
-            under_o = _fmt_odds(row.get("under_odds"))
-
-            if rec == "BET ✅":
-                rec_html = f'<span class="bet">{rec}</span>'
-            elif rec == "PASS":
-                rec_html = f'<span class="pass">PASS</span>'
-            else:
-                rec_html = f'<span class="note">{rec}</span>'
-
-            line_str = f"{direction} {line}" if line and not (isinstance(line, float) and pd.isna(line)) else "No line"
-            odds_str = f"O {over_o} / U {under_o}" if line else "—"
-
-            prop_rows.append(f"""
-            <tr>
-              <td>{rank}</td>
-              <td><strong>{name}</strong><br><span class="note">{team}</span></td>
-              <td>{proj:.2f}</td>
-              <td>{babip:.3f}</td>
-              <td>{wrc}</td>
-              <td>{line_str}<br><span class="note">{odds_str}</span></td>
-              <td>{rec_html}</td>
-            </tr>""")
-
-        sections.append(f"""
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>Batter</th><th>Proj Hits/G</th>
-              <th>BABIP</th><th>wRC+</th><th>Sportsbook Line</th><th>Rec</th>
-            </tr>
-          </thead>
-          <tbody>{"".join(prop_rows)}</tbody>
-        </table>""")
+        sections.append("<p>No bets available today.</p>")
 
     sections.append("""
     <div class="footer">
@@ -456,16 +275,8 @@ def run() -> None:
         print(f"  ERROR loading games:\n{traceback.format_exc()}")
         games_df = pd.DataFrame()
 
-    print("  Loading batter props...")
-    try:
-        props_df = _load_batter_props()
-        print(f"  Props loaded: {len(props_df)}")
-    except Exception:
-        print(f"  ERROR loading props:\n{traceback.format_exc()}")
-        props_df = pd.DataFrame()
-
     print("  Building email...")
-    html = _build_html(games_df, props_df, today)
+    html = _build_html(games_df, today)
     subject = f"🎯 Ballistic — MLB Picks {today.strftime('%a %b %-d')}"
 
     print(f"  Sending to {EMAIL_RECIPIENT}...")

@@ -3,7 +3,14 @@
 import pandas as pd
 import pytest
 
-from src.models.pythagorean import pythagorean_win_pct, compute_pythagorean
+from src.models.pythagorean import (
+    pythagorean_win_pct,
+    compute_pythagorean,
+    log5_probability,
+    regress_rs_ra,
+    MIN_GAMES_FOR_REGRESSION,
+    SHRINKAGE_K,
+)
 
 
 def test_equal_runs_gives_500():
@@ -76,3 +83,106 @@ def test_on_track_signal():
     })
     result = compute_pythagorean(df)
     assert result.iloc[0]["pyth_signal"] == "On Track"
+
+
+# ---------------------------------------------------------------------------
+# Log5
+# ---------------------------------------------------------------------------
+
+def test_log5_equal_teams():
+    assert log5_probability(0.5, 0.5) == pytest.approx(0.5, abs=0.001)
+
+
+def test_log5_reference_value():
+    # Bill James reference: .600 team vs .400 team → ~0.692
+    assert log5_probability(0.6, 0.4) == pytest.approx(0.6923, abs=0.001)
+
+
+def test_log5_asymmetric_strong_team():
+    # .700 vs .300: strong team wins ~84%
+    assert log5_probability(0.7, 0.3) == pytest.approx(0.8448, abs=0.001)
+
+
+def test_log5_reversed_is_complement():
+    p = log5_probability(0.6, 0.4)
+    p_rev = log5_probability(0.4, 0.6)
+    assert p + p_rev == pytest.approx(1.0, abs=0.001)
+
+
+def test_log5_degenerate_returns_half():
+    # Both zero or both one → denominator collapses → fallback 0.5
+    assert log5_probability(0.0, 0.0) == pytest.approx(0.5, abs=0.001)
+    assert log5_probability(1.0, 1.0) == pytest.approx(0.5, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
+# Regression to mean
+# ---------------------------------------------------------------------------
+
+def test_regression_below_threshold_unchanged():
+    rs, ra = regress_rs_ra(50, 30, MIN_GAMES_FOR_REGRESSION - 1, 4.5, 4.5)
+    assert rs == pytest.approx(50, abs=0.01)
+    assert ra == pytest.approx(30, abs=0.01)
+
+
+def test_regression_at_threshold_weight():
+    # At MIN_GAMES_FOR_REGRESSION games weight = G / (G + K)
+    G = MIN_GAMES_FOR_REGRESSION
+    rs_in, ra_in = 4.0 * G, 5.0 * G   # 4.0 and 5.0 R/G
+    league_rs, league_ra = 4.5, 4.5
+    rs_out, ra_out = regress_rs_ra(rs_in, ra_in, G, league_rs, league_ra)
+    w = G / (G + SHRINKAGE_K)
+    assert rs_out == pytest.approx((w * 4.0 + (1 - w) * league_rs) * G, abs=0.01)
+    assert ra_out == pytest.approx((w * 5.0 + (1 - w) * league_ra) * G, abs=0.01)
+
+
+def test_regression_162_games_weight():
+    w = 162 / (162 + SHRINKAGE_K)
+    assert w == pytest.approx(0.844, abs=0.005)
+
+
+def test_regression_league_avg_team_unchanged():
+    # A team already at league average should return the same values after regression
+    G = 81
+    league_avg = 4.5
+    rs, ra = regress_rs_ra(league_avg * G, league_avg * G, G, league_avg, league_avg)
+    assert rs == pytest.approx(league_avg * G, abs=0.01)
+    assert ra == pytest.approx(league_avg * G, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Formula state
+# ---------------------------------------------------------------------------
+
+def test_formula_state_early_season():
+    from src.models.win_probability import get_formula_state
+    ts = pd.DataFrame({
+        "team": ["NYY", "BOS"],
+        "wins": [8, 22],
+        "losses": [5, 10],
+        "runs_scored": [70, 180],
+        "runs_allowed": [60, 170],
+    })
+    state = get_formula_state(ts)
+    assert state["state"] == "EARLY_SEASON"
+    assert state["min_games"] == 13
+
+
+def test_formula_state_regression_active():
+    from src.models.win_probability import get_formula_state
+    ts = pd.DataFrame({
+        "team": ["NYY", "BOS"],
+        "wins": [22, 25],
+        "losses": [10, 12],
+        "runs_scored": [200, 210],
+        "runs_allowed": [180, 190],
+    })
+    state = get_formula_state(ts)
+    assert state["state"] == "REGRESSION_ACTIVE"
+    assert state["min_games"] >= MIN_GAMES_FOR_REGRESSION
+
+
+def test_formula_state_empty_df():
+    from src.models.win_probability import get_formula_state
+    state = get_formula_state(pd.DataFrame())
+    assert state["state"] == "EARLY_SEASON"

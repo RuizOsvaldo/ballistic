@@ -6,23 +6,31 @@ This document describes exactly what data the app pulls, how it maps to Joe Peta
 
 ## 1. Data Sources and What Is Fetched
 
-All baseball data comes from **pybaseball**, which wraps FanGraphs, Baseball Savant, and Baseball Reference. Odds data comes from **The Odds API**. All data is disk-cached in Parquet files to reduce API calls.
+Team-level stats (batting, pitching, standings) come from the **MLB Stats API** (free, no key).
+Individual pitcher and batter stats come from **pybaseball** (FanGraphs leaderboards).
+Schedule, starters, lineups, and live game state come from the **MLB Stats API**.
+Odds and props come from **The Odds API**. All data is disk-cached in Parquet files.
 
-| Source | pybaseball Call | Cache TTL | Columns Used |
+| Source | API / Call | Cache TTL | Columns Used |
 |---|---|---|---|
-| FanGraphs (team batting) | `team_batting(season)` | 6 hours | `team`, `games`, `runs_scored` |
-| FanGraphs (team pitching) | `team_pitching(season)` | 6 hours | `team`, `runs_allowed`, `era`, `fip` |
-| Baseball Reference (standings) | `standings(season)` | 6 hours | `team`, `wins`, `losses`, `win_pct` |
-| FanGraphs (pitcher leaderboard) | `pitching_stats(season, qual=1)` | 6 hours | `name`, `team`, `ip`, `era`, `fip`, `xfip`, `siera`, `babip`, `k_pct`, `bb_pct`, `hr9`, `whiff_pct`, `gb_pct`, `fb_pct` |
-| FanGraphs (batter leaderboard) | `batting_stats(season, qual=100)` | 6 hours | `name`, `team`, `pa`, `avg`, `obp`, `slg`, `wrc_plus`, `babip`, `k_pct`, `bb_pct`, `hard_hit_pct`, `barrel_pct`, `exit_velocity`, `hr`, `hits`, `ab`, `sb` |
+| MLB Stats API — team batting | `GET /stats?group=hitting&stats=season` | 6 hours | `team_id`, `runs`, `hits`, `homeRuns` |
+| MLB Stats API — team pitching | `GET /stats?group=pitching&stats=season` | 6 hours | `team_id`, `earnedRuns`, `era` |
+| MLB Stats API — standings | `GET /standings` | 6 hours | `team_id`, `wins`, `losses`, `winningPercentage` |
+| pybaseball → FanGraphs (pitchers) | `pitching_stats(season, qual=1)` | 6 hours | `name`, `team`, `ip`, `era`, `fip`, `xfip`, `siera`, `babip`, `k_pct`, `bb_pct`, `hr9`, `whiff_pct`, `gb_pct`, `fb_pct` |
+| MLB Stats API — batter stats | `GET /stats?group=hitting&stats=season` (player-level) | 6 hours | `name`, `team`, `pa`, `ab`, `avg`, `obp`, `slg`, `babip`, `k_pct`, `bb_pct`, `hr`, `hits`, `sb` |
+| MLB Stats API — schedule / starters | `GET /schedule?hydrate=probablePitcher` | 1 hour | `home_team`, `away_team`, `home_starter`, `away_starter` |
+| MLB Stats API — lineups | `GET /schedule?hydrate=lineups` | 0.5 hours | `team`, `player_name`, `batting_position` |
+| MLB Stats API — live game state | `GET /game/{gamePk}/feed/live` | real-time | score, inning, current pitcher |
 | The Odds API | `GET /v4/sports/baseball_mlb/odds` | 2 hours | moneylines (H2H), run lines, totals, player props |
 
-The team stats DataFrame is built by merging batting + pitching + records on `team`:
+The team stats DataFrame is built by merging MLB Stats API batting + pitching + records on `team_id` (integer):
 
 ```
-team_stats = records ⋈ batting ⋈ pitching
+team_stats = records ⋈ batting ⋈ pitching   (joined on team_id, not team name)
 team_stats["run_diff"] = runs_scored - runs_allowed
 ```
+
+**Why team_id instead of team name:** The MLB Stats API standings endpoint returns short names (e.g., "Yankees") while the stats endpoint returns full names (e.g., "New York Yankees"). Merging on the integer `team_id` avoids all name-format mismatches.
 
 ---
 
@@ -39,21 +47,36 @@ The app implements both, then combines them into a single win probability that i
 
 ## 3. Game Winner Model — Step by Step
 
-### Step 1: Pythagorean Win Expectation
+### Step 1: Pythagorean Win Expectation + Regression to the Mean
 
 **Source file:** [src/models/pythagorean.py](../../src/models/pythagorean.py)
 
-**What it is:** Derived from Bill James, used by Peta as the foundational team quality signal. A team's actual W-L record contains noise from one-run games, walk-off luck, and bullpen sequencing. Runs scored and runs allowed measure true offensive and defensive quality more reliably over a full season.
+**What it is:** Derived from Bill James (Pythagenpat variant), used by Peta as the foundational team quality signal. A team's actual W-L record contains noise from one-run games, walk-off luck, and bullpen sequencing. Runs scored and runs allowed measure true offensive and defensive quality more reliably over a full season.
 
 **Formula:**
 ```
-pyth_win_pct = RS² / (RS² + RA²)
+pyth_win_pct = RS^1.83 / (RS^1.83 + RA^1.83)
+```
+Exponent `1.83` (Pythagenpat) is empirically more accurate than the original 2.0 across modern MLB data.
+
+**Regression to the mean (early-season adjustment):**
+```
+MIN_GAMES = 20     # Threshold before regression activates, per team
+SHRINKAGE_K = 30   # Regresses 50% at 30 games, 73% at 81 games, 84% at 162 games
+
+weight = G / (G + 30)
+
+adj_RS_per_game = weight * (RS/G) + (1 - weight) * league_avg_RS_per_game
+adj_RA_per_game = weight * (RA/G) + (1 - weight) * league_avg_RA_per_game
 ```
 
+When a team has fewer than 20 games, raw RS/RA is used (small sample is too noisy to regress reliably). Once 20 games are played, the shrinkage blend activates automatically and the app displays a formula-change banner.
+
 **Data plugged in:**
-- `RS` = `team_stats["runs_scored"]` — season total runs scored (from FanGraphs team batting)
-- `RA` = `team_stats["runs_allowed"]` — season total runs allowed (from FanGraphs team pitching)
-- Exponent = `2.0` (Bill James canonical; 1.83 is empirically slightly better but 2.0 is used)
+- `RS` = `team_stats["runs_scored"]` — season total runs scored (MLB Stats API)
+- `RA` = `team_stats["runs_allowed"]` — season total runs allowed (MLB Stats API)
+- `G` = `wins + losses` — games played (MLB Stats API standings)
+- `league_avg_RS_per_game`, `league_avg_RA_per_game` — computed live as mean across all teams
 
 **Signal derived:**
 ```
@@ -136,46 +159,65 @@ When both FIP-ERA and BABIP signal the same direction, the combined severity is 
 
 **Source file:** [src/models/win_probability.py](../../src/models/win_probability.py)
 
-This function takes the Pythagorean base and layers in the starting pitcher adjustment and home field advantage to produce a single per-game win probability.
+This function combines all signals into a per-game win probability using the full Peta + sabermetrics pipeline.
 
 **Full formula:**
 ```
-league_avg_fip = IP-weighted mean of all pitchers' FIP
-               = Σ(pitcher_fip × pitcher_ip) / Σ(pitcher_ip)
+# --- League avg FIP (IP-weighted) ---
+league_avg_fip = Σ(pitcher_fip × pitcher_ip) / Σ(pitcher_ip)
                (fallback: 4.00 if data unavailable)
 
-home_pitch_adj = (league_avg_fip - home_starter_fip) × 0.03
-away_pitch_adj = (league_avg_fip - away_starter_fip) × 0.03
+# --- Step A: Log5 head-to-head base probability ---
+# Bill James Log5: true matchup probability given each team's overall quality
+home_pyth = pythagorean_win_pct(home_RS, home_RA)   # after regression if G >= 20
+away_pyth = pythagorean_win_pct(away_RS, away_RA)
 
-home_prob_raw = home_pyth_win_pct + home_pitch_adj + 0.04 - away_pitch_adj
-away_prob_raw = away_pyth_win_pct + away_pitch_adj - home_pitch_adj
+home_log5 = (home_pyth - home_pyth * away_pyth) / (home_pyth + away_pyth - 2 * home_pyth * away_pyth)
 
-# Normalize to sum to 1.0
+# --- Step B: Lineup quality matchup adjustment ---
+# Opposing lineup's avg OPS vs league avg (0.720) adjusts starter's effective FIP
+# Only applied when lineups are posted; otherwise effective_fip = actual fip
+lineup_adj_home_fip = (away_lineup_avg_ops - 0.720) * 3.0   # added to home starter FIP
+lineup_adj_away_fip = (home_lineup_avg_ops - 0.720) * 3.0   # added to away starter FIP
+
+effective_home_fip = home_starter_fip + lineup_adj_home_fip
+effective_away_fip = away_starter_fip + lineup_adj_away_fip
+
+# --- Step C: FIP pitcher adjustments ---
+home_pitch_adj = (league_avg_fip - effective_home_fip) × 0.03
+away_pitch_adj = (league_avg_fip - effective_away_fip) × 0.03
+
+# --- Step D: Home field and stack ---
+home_prob_raw = home_log5 + home_pitch_adj + 0.04 - away_pitch_adj
+away_prob_raw = (1 - home_log5) + away_pitch_adj - home_pitch_adj
+
+# --- Step E: Renormalize and clamp ---
 home_prob = home_prob_raw / (home_prob_raw + away_prob_raw)
 away_prob = away_prob_raw / (home_prob_raw + away_prob_raw)
 
-# Clamp to avoid extreme probabilities
-home_model_prob = clamp(home_prob, 0.05, 0.95)
-away_model_prob = clamp(away_prob, 0.05, 0.95)
+home_model_prob = clamp(home_prob, 0.30, 0.70)
+away_model_prob = clamp(away_prob, 0.30, 0.70)
 ```
 
 **Data plugged in:**
 
 | Variable | Source | Column |
 |---|---|---|
-| `home_pyth_win_pct` | Pythagorean model (Step 1) | `pyth_win_pct` for home team |
-| `away_pyth_win_pct` | Pythagorean model (Step 1) | `pyth_win_pct` for away team |
-| `home_starter_fip` | FanGraphs pitcher leaderboard | `pitcher_stats["fip"]` matched by starter name |
-| `away_starter_fip` | FanGraphs pitcher leaderboard | `pitcher_stats["fip"]` matched by starter name |
+| `home_RS`, `home_RA` | MLB Stats API (regression-adjusted if G ≥ 20) | `runs_scored`, `runs_allowed` |
+| `home_starter_fip` | pybaseball FanGraphs leaderboard | `pitcher_stats["fip"]` matched by starter name |
+| `away_starter_fip` | pybaseball FanGraphs leaderboard | `pitcher_stats["fip"]` matched by starter name |
+| `home_lineup_avg_ops` | MLB Stats API lineups + batter stats | `obp + slg` averaged across posted lineup |
+| `away_lineup_avg_ops` | MLB Stats API lineups + batter stats | `obp + slg` averaged across posted lineup |
 | `league_avg_fip` | Computed from all pitchers | IP-weighted mean of `pitcher_stats["fip"]` |
 
 **Constants:**
 - `HOME_FIELD_ADJ = 0.04` — 4% home field advantage
 - `FIP_ADJ_PER_POINT = 0.03` — each FIP point from league average shifts win prob by 3%
+- `LINEUP_OPS_SCALE = 3.0` — each 0.010 OPS above average adds 0.030 to opposing pitcher's effective FIP
+- `LEAGUE_AVG_OPS = 0.720` — MLB baseline; OPS used as proxy for wOBA (not available from MLB Stats API)
 
-**Interpretation:**
-- A pitcher with FIP of 3.00 against a league average of 4.00 adds `(4.00 - 3.00) × 0.03 = +3%` win probability to their team.
-- A pitcher with FIP of 5.00 subtracts `(4.00 - 5.00) × 0.03 = -3%` from their team's win probability.
+**Why Log5 instead of normalize(A+B):**
+The old approach of adding two independent Pythagorean W%s and normalizing does not account for the *relative* quality of the two teams. Log5 is the correct Bill James formula for deriving matchup probability from two teams' overall quality levels. A .600 team vs. a .400 team produces 0.692 (Log5) vs. 0.600 (old normalize), which is the empirically correct value.
 
 ---
 
@@ -185,13 +227,18 @@ away_model_prob = clamp(away_prob, 0.05, 0.95)
 
 **Vig removal:**
 ```
-raw_home_implied = |home_american_odds| / (|home_american_odds| + 100)  # if negative odds
-raw_away_implied = |away_american_odds| / (|away_american_odds| + 100)
+home_decimal = american_to_decimal(home_american_odds)
+away_decimal = american_to_decimal(away_american_odds)
 
-vig = raw_home_implied + raw_away_implied - 1.0
-home_implied_prob = raw_home_implied / (raw_home_implied + raw_away_implied)
-away_implied_prob = raw_away_implied / (raw_home_implied + raw_away_implied)
+raw_home = 1 / home_decimal
+raw_away = 1 / away_decimal
+
+# Normalise both sides to remove the book's juice
+home_implied_prob = raw_home / (raw_home + raw_away)
+away_implied_prob = raw_away / (raw_home + raw_away)
 ```
+
+This is computed inside `compute_kelly()` when `opponent_american_odds` is passed. Without vig removal, both sides of a -110/-110 market imply 52.4% — impossible since probabilities must sum to 100%. After removal each side correctly implies 50.0%.
 
 **Edge:**
 ```
@@ -408,10 +455,11 @@ These appear in the code as constants or defaults and represent planned improvem
 
 | Gap | Current State | Impact |
 |---|---|---|
-| Park factors | Hardcoded `1.0` | HR and total models are park-neutral |
-| Umpire zone factor | Hardcoded `1.0` | K prop projections don't adjust for ump |
+| Park factors | Static lookup table per ballpark | HR/total models use park factor; not dynamically adjusted for roof/weather |
+| Umpire zone factor | Hardcoded `1.0` | K prop projections don't adjust for ump tendencies |
 | Weather (MLB) | Not yet implemented | Wind and temp affect totals significantly |
-| Bullpen fatigue | Not yet implemented | Affects game totals, run line |
-| Injury/lineup data | Manual only | Starter must be verified before betting |
+| Bullpen fatigue | Not yet implemented | Heavy prior-day usage not captured |
+| Injury data | Manual only | Scratched starters not auto-detected |
 | Sprint speed / stolen base props | Data fetched, model not built | SB props not available |
-| Opponent k_pct (team-level) for pitcher Ks | Falls back to league avg (0.228) if not passed | Reduces precision on K props |
+| Opponent k_pct for pitcher Ks | Falls back to league avg (0.228) if not passed | Reduces precision on K props |
+| wOBA / wRC+ for lineup matchup | OPS used as proxy (r≈0.97 with wOBA) | MLB Stats API does not expose wOBA; FanGraphs batter endpoint returns 403 |

@@ -110,23 +110,13 @@ ballistic/
 
 ## Active Sprint State
 
-Sprints 1-8 are complete and documented in `docs/sprints/`.
-Sprint 9 work is in progress. Key completed items for Sprint 9:
-
-- **FanGraphs 403 fix**: `get_team_batting`, `get_team_pitching`, `get_team_records` in
-  `baseball_stats.py` were rewritten to use MLB Stats API. Merges are done on `team_id`
-  (numeric) to avoid name-format mismatches between the standings endpoint (short names)
-  and the stats endpoint (full names). Disk cache cleared after the migration.
-- **Game Analysis page** (`src/dashboard/pages/game_analysis.py`): Deep-dive per game —
-  Pythagorean signals, pitcher breakdown, bullpen comparison, park factor, AI reasoning.
-- **Player Analysis page** (`src/dashboard/pages/player_analysis.py`): Per-batter BABIP
-  regression, opposing pitcher FIP, park factor, AI reasoning. Lineup filter is per-team:
-  only filters a team's players when that team's lineup has been posted.
-- **Navigation**: Both analysis pages are Baseball sub-sections (Home → Baseball → Section
-  dropdown), not top-level nav pages.
-- **Bet slip**: Sidebar bet slip with singles/parlay logging, parlay payout preview.
-- **Bullpen + park factors** wired into win probability model.
-- **Live game feed**: `get_live_games()` in `game_results.py` tracks current pitcher per game.
+Sprints 1-11 are complete and documented in `docs/sprints/`.
+Sprint 9 key items: FanGraphs 403 fix (MLB Stats API), Game Analysis page, Player Analysis
+page, bet slip, bullpen + park factors wired into win probability, live game feed.
+Sprint 10 key items: Poisson run-line and game-total edge (±1.5 RL, O/U).
+Sprint 11 key items: Log5 head-to-head probability, RS/RA regression to mean (20-game
+threshold, automatic seasonal switch), lineup quality matchup FIP adjustment, vig-free
+implied probability, Pythagorean exponent 1.83, in-app formula state banner.
 
 Sprint files live at `docs/sprints/sprint-NN.md` using zero-padded numbering.
 
@@ -139,16 +129,29 @@ The short version:
 
 **Win probability pipeline:**
 ```
-Pythagorean W%  (runs scored / runs allowed)
-  + FIP pitcher adjustment  (league_avg_fip - starter_fip) * 0.03
-  + home field adjustment   +0.04
-  + bullpen FIP adjustment  (bullpen_fip - league_avg_bp_fip) * 0.33 * 0.5
-  = normalized win prob     clamped 0.30 - 0.70
+Step 1:  Pythagorean W% for each team (RS^1.83 / (RS^1.83 + RA^1.83))
+         -- if team has >= 20 games: RS/RA blended with league mean
+            weight = G / (G + 30); before 20 games: raw RS/RA used
+
+Step 2:  Log5 head-to-head prob  P = (A - A*B) / (A + B - 2*A*B)
+         -- gives true matchup probability, not just normalize(A+B)
+
+Step 3:  Starter FIP adjustment
+         home_fip_adj = (league_avg_fip - home_starter_fip) * 0.03
+         -- effective_fip adjusted for opposing lineup OPS vs league avg (0.720)
+            lineup_adj = (lineup_avg_ops - 0.720) * 3.0
+
+Step 4:  Home field +0.04
+
+Step 5:  Bullpen FIP adjustment  (opp_bullpen_fip - league_avg) * 0.33 * 0.30
+
+Step 6:  Renormalize + clamp [0.30, 0.70]
 ```
 
 **Edge and Kelly:**
 ```
-edge = model_prob - vig_removed_implied_prob
+edge = model_prob - vig_free_implied_prob
+     vig_free: raw / (raw_home + raw_away)  -- vig removed before edge calc
 flag when edge >= 3%
 kelly_stake = (b*p - q) / b * 0.5   (half-Kelly, capped at 5% of bankroll)
 ```

@@ -42,4 +42,4 @@ def render_edge_table(df: pd.DataFrame, edge_col: str = "best_bet_edge") -> None
         na_rep="—",
     )
 
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)

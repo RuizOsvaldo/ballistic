@@ -186,6 +186,15 @@ def render(
         "starter FIP signals, bullpen strength, park factor, and AI reasoning."
     )
 
+    # Formula state banner
+    if team_stats is not None and not team_stats.empty:
+        from src.models.win_probability import get_formula_state
+        state = get_formula_state(team_stats)
+        if state["state"] == "EARLY_SEASON":
+            st.info(state["message"])
+        else:
+            st.success(state["message"])
+
     if games_df.empty:
         st.warning("No games loaded. Check ODDS_API_KEY in .env.")
         return
@@ -271,7 +280,7 @@ def render(
 
     with col_chart:
         fig = _win_prob_chart(home, away, home_prob, away_prob, home_impl, away_impl)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_metrics:
         st.metric(f"{away} Model Prob", f"{away_prob:.1%}",

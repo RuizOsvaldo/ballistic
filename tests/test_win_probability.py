@@ -1,9 +1,15 @@
 """Unit tests for win_probability.py"""
 
 import pytest
-
-from src.models.win_probability import game_win_probability, compute_league_avg_fip
 import pandas as pd
+
+from src.models.win_probability import (
+    game_win_probability,
+    compute_league_avg_fip,
+    lineup_matchup_fip_adjustment,
+    LEAGUE_AVG_OPS,
+    LINEUP_OPS_SCALE,
+)
 
 
 class TestGameWinProbability:
@@ -58,3 +64,56 @@ class TestComputeLeagueAvgFip:
         avg = compute_league_avg_fip(df)
         # Weighted toward the 2.00 pitcher with more IP
         assert avg < 4.00
+
+
+# ---------------------------------------------------------------------------
+# Lineup matchup FIP adjustment
+# ---------------------------------------------------------------------------
+
+def _make_lineup(team: str, names: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({"team": [team] * len(names), "player_name": names})
+
+
+def _make_batters(names: list[str], obp: float, slg: float) -> pd.DataFrame:
+    return pd.DataFrame({"name": names, "obp": [obp] * len(names), "slg": [slg] * len(names)})
+
+
+class TestLineupMatchupFipAdjustment:
+    def test_league_avg_lineup_returns_zero(self):
+        # OBP + SLG = LEAGUE_AVG_OPS → adjustment = 0
+        obp = LEAGUE_AVG_OPS * 0.45   # rough split
+        slg = LEAGUE_AVG_OPS * 0.55
+        lineup = _make_lineup("NYY", ["A", "B", "C"])
+        batters = _make_batters(["A", "B", "C"], obp, slg)
+        adj = lineup_matchup_fip_adjustment(lineup, batters, "NYY")
+        assert adj == pytest.approx(0.0, abs=0.01)
+
+    def test_strong_lineup_positive_adjustment(self):
+        # OPS 0.770 → (0.770 - 0.720) * 3.0 = +0.15
+        lineup = _make_lineup("BOS", ["X", "Y", "Z"])
+        batters = _make_batters(["X", "Y", "Z"], obp=0.360, slg=0.410)
+        adj = lineup_matchup_fip_adjustment(lineup, batters, "BOS")
+        assert adj == pytest.approx(0.15, abs=0.01)
+
+    def test_weak_lineup_negative_adjustment(self):
+        # OPS 0.620 → (0.620 - 0.720) * 3.0 = -0.30
+        lineup = _make_lineup("MIA", ["P", "Q", "R"])
+        batters = _make_batters(["P", "Q", "R"], obp=0.290, slg=0.330)
+        adj = lineup_matchup_fip_adjustment(lineup, batters, "MIA")
+        assert adj == pytest.approx(-0.30, abs=0.01)
+
+    def test_empty_lineup_returns_zero(self):
+        batters = _make_batters(["A"], obp=0.350, slg=0.450)
+        adj = lineup_matchup_fip_adjustment(pd.DataFrame(), batters, "NYY")
+        assert adj == 0.0
+
+    def test_empty_batter_stats_returns_zero(self):
+        lineup = _make_lineup("NYY", ["A"])
+        adj = lineup_matchup_fip_adjustment(lineup, pd.DataFrame(), "NYY")
+        assert adj == 0.0
+
+    def test_no_matching_players_returns_zero(self):
+        lineup = _make_lineup("NYY", ["Unknown Player"])
+        batters = _make_batters(["Someone Else"], obp=0.350, slg=0.450)
+        adj = lineup_matchup_fip_adjustment(lineup, batters, "NYY")
+        assert adj == 0.0

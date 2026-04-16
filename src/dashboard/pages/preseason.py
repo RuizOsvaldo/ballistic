@@ -106,7 +106,7 @@ def render() -> None:
         fig.add_hline(y=-MIN_EDGE_WINS, line_dash="dash", line_color="red",
                       annotation_text=f"-{MIN_EDGE_WINS} UNDER threshold")
         fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ---- Projections table ----
     st.subheader("Full Projection Table")
@@ -162,7 +162,7 @@ def render() -> None:
     if "Edge (wins)" in display_df.columns:
         styled = styled.applymap(_color_edge, subset=["Edge (wins)"])
 
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     # ---- AI Reasoning for top bets ----
     st.subheader("AI Reasoning — Top Win Total Bets")

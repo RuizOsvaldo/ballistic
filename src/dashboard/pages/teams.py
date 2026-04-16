@@ -65,7 +65,7 @@ def render(team_stats: pd.DataFrame) -> None:
         fig.add_hline(y=0.05, line_dash="dash", line_color="red", annotation_text="+5% (overperforming)")
         fig.add_hline(y=-0.05, line_dash="dash", line_color="green", annotation_text="-5% (underperforming)")
         fig.update_layout(showlegend=False, height=350)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ---- Team stats table ----
     st.subheader("Team Stats Table")
@@ -93,7 +93,7 @@ def render(team_stats: pd.DataFrame) -> None:
             lambda x: f"+{x*100:.1f}%" if x > 0 else f"{x*100:.1f}%"
         )
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width="stretch", hide_index=True)
 
     # ---- Regression signal cards ----
     if "team_signal_severity" in df.columns:

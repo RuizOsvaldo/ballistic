@@ -144,6 +144,120 @@ def load_games_data(team_stats: pd.DataFrame, pitcher_stats: pd.DataFrame, bankr
 # Page render functions
 # ---------------------------------------------------------------------------
 
+def _to_decimal(american: float) -> float:
+    """Convert American odds to decimal multiplier."""
+    if american is None or american == 0:
+        return 1.909  # -110 default
+    return (american / 100 + 1) if american > 0 else (100 / abs(american) + 1)
+
+
+def _fmt_american(val) -> str:
+    """Format American odds with sign."""
+    if val is None or (isinstance(val, float) and (val != val)):
+        return "N/A"
+    v = int(val)
+    return f"+{v}" if v > 0 else str(v)
+
+
+@st.dialog("Review & Submit Bets")
+def _bet_slip_submit_dialog(slip: list, today_str: str) -> None:
+    """Modal showing each bet with editable odds/stake before saving."""
+    st.markdown(f"**{len(slip)} bet(s) — adjust odds to match your book before saving**")
+    st.divider()
+
+    # Build a mutable copy so edits in the form persist within this dialog
+    edited = []
+    for i, bet in enumerate(slip):
+        st.markdown(f"**{bet['matchup']}**")
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            st.caption(bet["description"])
+        with c2:
+            new_odds = st.number_input(
+                "Odds",
+                value=int(bet.get("line") or -110),
+                step=5,
+                key=f"dlg_odds_{i}",
+                help="Edit to match your sportsbook's actual line",
+            )
+        with c3:
+            new_stake = st.number_input(
+                "Stake $",
+                min_value=1.0,
+                value=float(bet.get("stake") or 50.0),
+                step=5.0,
+                key=f"dlg_stake_{i}",
+            )
+        edited.append({**bet, "line": float(new_odds), "stake": float(new_stake)})
+        if i < len(slip) - 1:
+            st.divider()
+
+    # Parlay preview (uses edited odds)
+    if len(edited) >= 2:
+        st.divider()
+        combined_decimal = 1.0
+        for bet in edited:
+            combined_decimal *= _to_decimal(bet.get("line", -110))
+        total_stake = edited[0].get("stake", 50.0)
+        payout = total_stake * combined_decimal
+        profit = payout - total_stake
+        parlay_odds = int((combined_decimal - 1) * 100)
+        st.markdown(
+            f"**Parlay odds:** +{parlay_odds}  "
+            f"| **Payout:** ${payout:,.2f}  |  **Profit:** ${profit:,.2f}"
+        )
+        st.caption(f"Based on ${total_stake:.0f} stake on first leg.")
+
+    st.divider()
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+    with btn_col1:
+        if st.button("✅ Save Singles", type="primary", width="stretch"):
+            for bet in edited:
+                insert_bet({
+                    "date":        today_str,
+                    "matchup":     bet["matchup"],
+                    "bet_side":    bet["description"],
+                    "line":        bet["line"],
+                    "stake":       bet["stake"],
+                    "edge_pct":    bet.get("edge_pct", 0),
+                    "model_prob":  bet.get("model_prob"),
+                    "signal_type": "Multiple",
+                    "outcome":     "Pending",
+                    "pnl":         0.0,
+                    "bet_type":    "Single",
+                })
+            st.session_state.bet_slip = []
+            st.success(f"Saved {len(edited)} single bet(s)!")
+            st.rerun()
+
+    with btn_col2:
+        if st.button("🔗 Save Parlay", type="primary", width="stretch"):
+            legs = [
+                {
+                    "date":        today_str,
+                    "matchup":     bet["matchup"],
+                    "bet_side":    bet["description"],
+                    "line":        bet["line"],
+                    "stake":       bet["stake"],
+                    "edge_pct":    bet.get("edge_pct", 0),
+                    "model_prob":  bet.get("model_prob"),
+                    "signal_type": "Multiple",
+                    "outcome":     "Pending",
+                    "pnl":         0.0,
+                }
+                for bet in edited
+            ]
+            insert_parlay(legs)
+            st.session_state.bet_slip = []
+            st.success(f"Saved {len(legs)}-leg parlay!")
+            st.rerun()
+
+    with btn_col3:
+        if st.button("Cancel", width="stretch"):
+            st.rerun()
+
+
 def _render_bet_slip_sidebar(bankroll: float) -> None:
     """Render the bet slip in the sidebar."""
     if "bet_slip" not in st.session_state:
@@ -183,11 +297,6 @@ def _render_bet_slip_sidebar(bankroll: float) -> None:
 
     # ── Parlay payout preview ──────────────────────────────────────
     if len(slip) >= 2:
-        def _to_decimal(american: float) -> float:
-            if american is None or american == 0:
-                return 1.909  # -110 default
-            return (american / 100 + 1) if american > 0 else (100 / abs(american) + 1)
-
         combined_decimal = 1.0
         total_stake = slip[0].get("stake", 50.0)
         for bet in slip:
@@ -198,60 +307,21 @@ def _render_bet_slip_sidebar(bankroll: float) -> None:
             f"**Parlay odds:** +{int((combined_decimal - 1) * 100)}  "
             f"| **Payout:** ${payout:,.2f}  |  **Profit:** ${profit:,.2f}",
         )
-        st.caption(f"Based on ${total_stake:.0f} stake on first leg. Each leg uses its listed odds.")
+        st.caption(f"Based on ${total_stake:.0f} stake on first leg.")
 
     st.divider()
 
     import datetime as _dt
     today_str = str(_dt.date.today())
 
-    log_col1, log_col2 = st.columns(2)
-
-    with log_col1:
-        if st.button("✅ Log as Singles", use_container_width=True):
-            for bet in slip:
-                insert_bet({
-                    "date":        today_str,
-                    "matchup":     bet["matchup"],
-                    "bet_side":    bet["description"],
-                    "line":        bet.get("line", 0),
-                    "stake":       bet.get("stake", 50.0),
-                    "edge_pct":    bet.get("edge_pct", 0),
-                    "model_prob":  bet.get("model_prob"),
-                    "signal_type": "Multiple",
-                    "outcome":     "Pending",
-                    "pnl":         0.0,
-                    "bet_type":    "Single",
-                })
+    sub_col, clr_col = st.columns(2)
+    with sub_col:
+        if st.button("📤 Submit", width="stretch", type="primary"):
+            _bet_slip_submit_dialog(list(slip), today_str)
+    with clr_col:
+        if st.button("🗑 Clear", width="stretch"):
             st.session_state.bet_slip = []
-            st.success(f"Logged {len(slip)} single bet(s)!")
             st.rerun()
-
-    with log_col2:
-        if st.button("🔗 Log as Parlay", use_container_width=True):
-            legs = [
-                {
-                    "date":        today_str,
-                    "matchup":     bet["matchup"],
-                    "bet_side":    bet["description"],
-                    "line":        bet.get("line", 0),
-                    "stake":       bet.get("stake", 50.0),
-                    "edge_pct":    bet.get("edge_pct", 0),
-                    "model_prob":  bet.get("model_prob"),
-                    "signal_type": "Multiple",
-                    "outcome":     "Pending",
-                    "pnl":         0.0,
-                }
-                for bet in slip
-            ]
-            insert_parlay(legs)
-            st.session_state.bet_slip = []
-            st.success(f"Logged {len(legs)}-leg parlay!")
-            st.rerun()
-
-    if st.button("🗑 Clear Slip", use_container_width=True):
-        st.session_state.bet_slip = []
-        st.rerun()
 
 
 def _render_game_analysis() -> None:
@@ -378,6 +448,14 @@ def _render_analysis() -> None:
     analysis_page.render()
 
 
+def _render_about() -> None:
+    from src.dashboard.pages import about as about_page
+    with st.sidebar:
+        st.title("🎯 Ballistic")
+        st.divider()
+    about_page.render()
+
+
 # ---------------------------------------------------------------------------
 # Navigation — replaces Streamlit's auto-discovered pages/ tabs
 # ---------------------------------------------------------------------------
@@ -387,6 +465,7 @@ pg = st.navigation(
         st.Page(_render_home, title="Home", icon="🏠", default=True),
         st.Page(_render_bet_log, title="Bet Log", icon="📒"),
         st.Page(_render_analysis, title="Analysis", icon="📊"),
+        st.Page(_render_about, title="About", icon="📖"),
     ],
     position="sidebar",
 )

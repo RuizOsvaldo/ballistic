@@ -71,19 +71,29 @@ League average BABIP is approximately .300. It is largely outside a pitcher's co
 
 ### 4. Win Probability Model
 
-Combines all signals into a single estimated win probability per game:
+Combines all signals into a single estimated win probability per game using the full Peta + sabermetrics pipeline:
 
 ```
-base_prob       = team_pythagorean_win_pct
-pitcher_adj     = (league_avg_fip - starter_fip) * 0.03   # ~3% per FIP point
-home_field_adj  = +0.04 if home else 0.0
-babip_adj       = small adjustment based on BABIP deviation
-win_prob        = clamp(base_prob + pitcher_adj + home_field_adj + babip_adj, 0.05, 0.95)
+Step 1: Pythagorean W% per team — RS^1.83 / (RS^1.83 + RA^1.83)
+        Early season (< 20 games): raw RS/RA used
+        After 20 games: RS/RA blended toward league mean (weight = G / (G + 30))
+
+Step 2: Log5 head-to-head probability — P = (A - A*B) / (A + B - 2*A*B)
+        Converts two independent Pythagorean W%s into a true matchup probability
+
+Step 3: Starter FIP adjustment (+/- 3% per FIP point vs. league avg)
+        Effective FIP adjusted for opposing lineup quality: (lineup_avg_OPS - 0.720) * 3.0
+
+Step 4: Home field +0.04
+
+Step 5: Bullpen FIP adjustment
+
+Step 6: Renormalize + clamp [0.30, 0.70]
 ```
 
-**Edge:** `edge = win_prob - implied_prob_from_odds`
+**Edge:** `edge = win_prob - vig_free_implied_prob` (both sides normalized to remove the book's juice)
 
-Bets are only flagged when edge > 3% (configurable).
+Bets are only flagged when edge ≥ 3%.
 
 ---
 
@@ -206,7 +216,17 @@ Only Medium and High signals trigger a bet recommendation. Low signals are displ
 
 ## Limitations and Risks
 
-- **Sample size:** Early-season models are less reliable. Signal quality improves after ~40 team games.
+- **Sample size:** Early-season models use raw RS/RA before 20 games. The app automatically switches to full regression-to-mean mode and displays a banner once all teams cross 20 games.
+- **Lineup matchup uses OPS, not wOBA:** The MLB Stats API does not expose wOBA or wRC+. OPS (OBP + SLG) is used as a proxy (r ≈ 0.97 with wOBA).
 - **Injury information:** The model does not automatically ingest injury reports. Always verify lineup before betting.
 - **Bullpen volatility:** Starter models do not account for when a starter gets knocked out early.
 - **Line movement:** Odds are fetched at a point in time. Sharp money can move lines significantly before game time.
+- **Weather:** Wind direction and temperature affect game totals significantly. Not yet wired into the model.
+
+## Data Sources
+
+| Source | Access Method | Data |
+|---|---|---|
+| MLB Stats API | REST API (free, no key) | Team stats (batting/pitching/standings), schedule, starters, lineups, live game state |
+| FanGraphs | pybaseball | Pitcher FIP, xFIP, SIERA, BABIP, K%, whiff% |
+| The Odds API | REST API (key required) | Moneylines, run lines, totals, player props |
