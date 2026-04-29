@@ -11,7 +11,11 @@ from src.data.cache import cached
 
 _SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
 _ODDS_URL = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb/events/{event_id}/competitions/{event_id}/odds"
+_MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 _TIMEOUT = 10
+
+# ESPN status names that mean the game is not being played today
+_SKIP_STATUSES = {"STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_SUSPENDED", "STATUS_RAIN_DELAY"}
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +71,49 @@ def _fetch_espn_odds(event_id: str) -> dict | None:
 
 
 def _fetch_espn_scoreboard() -> list[dict]:
-    """Return list of today's ESPN event dicts from the scoreboard endpoint."""
+    """Return today's ESPN event dicts, excluding postponed or cancelled games."""
     resp = requests.get(_SCOREBOARD_URL, timeout=_TIMEOUT)
     resp.raise_for_status()
-    return resp.json().get("events", [])
+    events = resp.json().get("events", [])
+    active = []
+    for event in events:
+        comp = event.get("competitions", [{}])[0]
+        status_name = comp.get("status", {}).get("type", {}).get("name", "")
+        if status_name not in _SKIP_STATUSES:
+            active.append(event)
+    return active
+
+
+def _fetch_mlb_scheduled_games(date: datetime.date) -> set[tuple[str, str]]:
+    """
+    Return a set of (away_team_name, home_team_name) for games on the MLB Stats API
+    schedule for the given date. Used to cross-validate ESPN odds.
+    Only includes games with status Preview, Scheduled, Live, or Final (not Postponed).
+    """
+    try:
+        resp = requests.get(
+            _MLB_SCHEDULE_URL,
+            params={"sportId": 1, "date": date.strftime("%Y-%m-%d")},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return set()
+
+    pairs: set[tuple[str, str]] = set()
+    for date_entry in data.get("dates", []):
+        for game in date_entry.get("games", []):
+            # Skip postponed/suspended games from MLB API too
+            detail = game.get("status", {}).get("detailedState", "")
+            if "Postponed" in detail or "Suspended" in detail or "Cancelled" in detail:
+                continue
+            teams = game.get("teams", {})
+            home = teams.get("home", {}).get("team", {}).get("name", "")
+            away = teams.get("away", {}).get("team", {}).get("name", "")
+            if home and away:
+                pairs.add((away, home))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -164,30 +207,9 @@ def _build_game_row(event: dict, odds: dict) -> dict | None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_mlb_odds() -> pd.DataFrame:
-    """
-    Return today's MLB games with moneyline, run line, and game total from ESPN.
-    No API key required. Cached for 6 hours.
-    """
-    def fetch():
-        events = _fetch_espn_scoreboard()
-        rows = []
-        for event in events:
-            event_id = event.get("id", "")
-            odds = _fetch_espn_odds(event_id)
-            if odds is None:
-                continue
-            row = _build_game_row(event, odds)
-            if row is not None:
-                rows.append(row)
-        return pd.DataFrame(rows)
-
-    return cached("mlb_odds", fetch, ttl_hours=6.0)
-
-
-def get_mlb_odds_no_cache() -> pd.DataFrame:
-    """Bypass cache — always fetch fresh MLB odds from ESPN."""
-    events = _fetch_espn_scoreboard()
+def _build_odds_rows(events: list[dict]) -> list[dict]:
+    """Fetch odds for each event and return valid rows, cross-validated against MLB schedule."""
+    mlb_games = _fetch_mlb_scheduled_games(datetime.date.today())
     rows = []
     for event in events:
         event_id = event.get("id", "")
@@ -195,9 +217,41 @@ def get_mlb_odds_no_cache() -> pd.DataFrame:
         if odds is None:
             continue
         row = _build_game_row(event, odds)
-        if row is not None:
-            rows.append(row)
-    return pd.DataFrame(rows)
+        if row is None:
+            continue
+        # Drop the game if neither team pairing appears in today's MLB schedule.
+        # This catches games ESPN lists that are not actually scheduled today.
+        if mlb_games:
+            home = row["home_team"]
+            away = row["away_team"]
+            match = any(
+                (home_part in home or home in home_part) and
+                (away_part in away or away in away_part)
+                for away_part, home_part in mlb_games
+            )
+            if not match:
+                continue
+        rows.append(row)
+    return rows
+
+
+def get_mlb_odds() -> pd.DataFrame:
+    """
+    Return today's MLB games with moneyline, run line, and game total from ESPN.
+    Postponed/cancelled games are excluded. Cross-validated against the MLB Stats API.
+    No API key required. Cached for 2 hours.
+    """
+    def fetch():
+        events = _fetch_espn_scoreboard()
+        return pd.DataFrame(_build_odds_rows(events))
+
+    return cached("mlb_odds", fetch, ttl_hours=2.0)
+
+
+def get_mlb_odds_no_cache() -> pd.DataFrame:
+    """Bypass cache — always fetch fresh MLB odds from ESPN."""
+    events = _fetch_espn_scoreboard()
+    return pd.DataFrame(_build_odds_rows(events))
 
 
 def get_mlb_totals() -> pd.DataFrame:

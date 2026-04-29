@@ -304,7 +304,7 @@ def _render_batter_card(row: dict) -> None:
 
         col_gauge, col_right = st.columns([1, 2])
         with col_gauge:
-            st.plotly_chart(_babip_gauge(babip), width="stretch")
+            st.plotly_chart(_babip_gauge(babip), use_container_width=True)
 
         with col_right:
             # ── Opposing pitcher breakdown ────────────────────────────────────
@@ -501,7 +501,7 @@ def render() -> None:
 
         st.dataframe(
             sum_df.style.applymap(_color_rec, subset=["Rec"]),
-            width="stretch", hide_index=True,
+            use_container_width=True, hide_index=True,
         )
 
     st.divider()

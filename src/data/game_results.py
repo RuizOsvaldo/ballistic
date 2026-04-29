@@ -443,13 +443,25 @@ def verify_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
     df = predictions_df.copy()
     today = datetime.date.today()
 
-    unverified = df[df["actual_winner"].isna()].copy()
-    if unverified.empty:
+    # Include rows needing ML verification, missing scores, or RL/O/U re-verification.
+    # The scores condition catches rows verified before actual_home/away_score columns existed.
+    scores_missing = (
+        df["actual_winner"].notna() &
+        (df["actual_winner"] != "Postponed") &
+        (df["actual_home_score"].isna() | df["actual_away_score"].isna())
+    )
+    needs_verify = df[
+        df["actual_winner"].isna() |
+        scores_missing |
+        (df["rl_side"].notna() & df["rl_correct"].isna()) |
+        (df["total_direction"].notna() & df["total_correct"].isna())
+    ].copy()
+    if needs_verify.empty:
         return df
 
     # Only verify past games (not today's)
-    unverified["_date"] = pd.to_datetime(unverified["prediction_date"]).dt.date
-    past = unverified[unverified["_date"] < today]
+    needs_verify["_date"] = pd.to_datetime(needs_verify["prediction_date"]).dt.date
+    past = needs_verify[needs_verify["_date"] < today]
 
     if past.empty:
         return df
@@ -467,15 +479,39 @@ def verify_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
         game_date = str(pred_row["prediction_date"])
         home = pred_row["home_team"]
         away = pred_row["away_team"]
+        home_kw = home.split()[-1]
+        away_kw = away.split()[-1]
 
-        # Try to match game result
+        # Both teams must appear somewhere in the result row (either column)
         match = results[
             (results["game_date"] == game_date) &
-            (results["home_team"].str.contains(home.split()[-1], case=False, na=False) |
-             results["away_team"].str.contains(away.split()[-1], case=False, na=False))
+            (
+                results["home_team"].str.contains(home_kw, case=False, na=False) |
+                results["away_team"].str.contains(home_kw, case=False, na=False)
+            ) &
+            (
+                results["home_team"].str.contains(away_kw, case=False, na=False) |
+                results["away_team"].str.contains(away_kw, case=False, na=False)
+            )
         ]
 
         if match.empty:
+            # No Final result exists — game was postponed or cancelled
+            df.at[idx, "actual_winner"] = "Postponed"
+            df.at[idx, "correct"] = -1
+            df.at[idx, "verified_at"] = verified_at
+            rl_mark = -1 if pd.notna(pred_row.get("rl_side")) else None
+            total_mark = -1 if pd.notna(pred_row.get("total_direction")) else None
+            if rl_mark is not None:
+                df.at[idx, "rl_correct"] = rl_mark
+            if total_mark is not None:
+                df.at[idx, "total_correct"] = total_mark
+            from src.data.predictions_db import update_result
+            update_result(
+                game_date, home, away, "Postponed", -1, verified_at,
+                rl_correct=rl_mark,
+                total_correct=total_mark,
+            )
             continue
 
         result_row = match.iloc[0]
@@ -501,13 +537,14 @@ def verify_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
         total_direction = pred_row.get("total_direction")
         total_line = pred_row.get("total_line")
         total_correct: int | None = None
-        if total_direction is not None and total_line is not None:
+        if total_direction is not None and not pd.isna(total_direction) and total_line is not None and not pd.isna(total_line):
             try:
                 actual_total = home_score + away_score
                 tl = float(total_line)
-                if total_direction == "OVER":
+                direction_upper = str(total_direction).upper()
+                if direction_upper == "OVER":
                     total_correct = 1 if actual_total > tl else (None if actual_total == tl else 0)
-                elif total_direction == "UNDER":
+                elif direction_upper == "UNDER":
                     total_correct = 1 if actual_total < tl else (None if actual_total == tl else 0)
             except (TypeError, ValueError):
                 pass
@@ -523,7 +560,7 @@ def verify_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
         # Persist to DB
         from src.data.predictions_db import update_result
         update_result(
-            game_date, home, away, actual_winner, bool(correct), verified_at,
+            game_date, home, away, actual_winner, correct, verified_at,
             actual_home_score=home_score,
             actual_away_score=away_score,
             rl_correct=rl_correct,

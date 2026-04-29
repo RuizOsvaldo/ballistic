@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-DB_PATH = Path("data/bet_log.db")
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "bet_log.db"
 
 
 def _connect() -> sqlite3.Connection:
@@ -162,14 +162,14 @@ def update_result(
     home_team: str,
     away_team: str,
     actual_winner: str,
-    correct: bool,
+    correct: int,
     verified_at: str,
     actual_home_score: int | None = None,
     actual_away_score: int | None = None,
     rl_correct: int | None = None,
     total_correct: int | None = None,
 ) -> None:
-    """Persist ML result plus RL and total outcome columns."""
+    """Persist ML result plus RL and total outcome columns. correct=-1 means postponed."""
     _init()
     actual_total = (
         float(actual_home_score + actual_away_score)
@@ -184,7 +184,7 @@ def update_result(
                 rl_correct = ?, total_correct = ?
             WHERE prediction_date = ? AND home_team = ? AND away_team = ?
         """, (
-            actual_winner, int(correct), verified_at,
+            actual_winner, correct, verified_at,
             actual_home_score, actual_away_score, actual_total,
             rl_correct, total_correct,
             prediction_date, home_team, away_team,

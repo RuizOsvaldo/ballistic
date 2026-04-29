@@ -15,7 +15,10 @@ import streamlit as st
 import numpy as np
 from src.data.predictions_db import load_predictions
 from src.data.game_results import verify_predictions
-from src.data.bet_log_db import load_bets, get_best_bet_type
+from src.data.bet_log_db import (
+    load_bets, get_best_bet_type, insert_bet, insert_parlay, save_all, update_parlay,
+    OUTCOMES, SIGNAL_TYPES, BET_TYPES,
+)
 from src.data.baseball_stats import get_historical_team_stats, get_team_stats
 from src.models.calibration import (
     compute_calibration_table,
@@ -25,21 +28,43 @@ from src.models.calibration import (
 )
 
 
+def _ml_bet_correct(row: pd.Series) -> int | None:
+    """Whether the bet_side team actually won (not whether predicted_winner won)."""
+    actual = row.get("actual_winner")
+    if not actual or pd.isna(actual):
+        return None
+    side = str(row.get("bet_side", "")).upper()
+    if side == "HOME":
+        team = row["home_team"]
+    elif side == "AWAY":
+        team = row["away_team"]
+    else:
+        return None
+    return int(team in str(actual) or str(actual) in team)
+
+
 def _accuracy_summary(df: pd.DataFrame) -> dict:
-    verified = df[df["correct"].notna()].copy()
+    verified = df[(df["correct"].notna()) & (df["correct"] != -1)].copy()
     if verified.empty:
         return {}
     n = len(verified)
     correct = int(verified["correct"].sum())
     acc = correct / n
-    # Accuracy on bets only (where model had a bet recommendation)
-    bets = verified[verified["bet_side"] != "PASS"]
-    bet_acc = (bets["correct"].sum() / len(bets)) if not bets.empty else None
+    # Bet accuracy: whether the bet_side team won (not predicted_winner)
+    bets = verified[verified["bet_side"].notna() & (verified["bet_side"] != "PASS")].copy()
+    if not bets.empty:
+        bets["_bet_correct"] = bets.apply(_ml_bet_correct, axis=1)
+        settled = bets[bets["_bet_correct"].notna()]
+        bet_acc = settled["_bet_correct"].mean() if not settled.empty else None
+        bet_games = len(settled)
+    else:
+        bet_acc = None
+        bet_games = 0
     return {
         "total_games": n,
         "correct": correct,
         "accuracy": acc,
-        "bet_games": len(bets),
+        "bet_games": bet_games,
         "bet_accuracy": bet_acc,
     }
 
@@ -189,15 +214,18 @@ def _render_prediction_accuracy(preds: pd.DataFrame) -> None:
         )
         return
 
-    verified = preds[preds["correct"].notna()].copy()
+    all_verified = preds[preds["correct"].notna()].copy()
+    active_verified = all_verified[all_verified["correct"] != -1].copy()
+    postponed = all_verified[all_verified["correct"] == -1]
     pending = preds[preds["correct"].isna()]
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Games Predicted", len(preds))
-    col2.metric("Verified", len(verified))
+    col2.metric("Verified", len(active_verified))
     col3.metric("Pending", len(pending))
+    col4.metric("Postponed", len(postponed))
 
-    if verified.empty:
+    if active_verified.empty:
         st.info("Results haven't been verified yet. Verification runs automatically for past games.")
         return
 
@@ -208,7 +236,8 @@ def _render_prediction_accuracy(preds: pd.DataFrame) -> None:
               help="Accuracy on games where model had an edge recommendation")
     c3.metric("Games w/ Bet Signal", stats.get("bet_games", 0))
 
-    # Daily accuracy chart
+    # Daily accuracy chart (exclude postponed)
+    verified = active_verified
     verified["date"] = pd.to_datetime(verified["prediction_date"]).dt.date
     daily = verified.groupby("date").agg(
         games=("correct", "count"),
@@ -232,7 +261,7 @@ def _render_prediction_accuracy(preds: pd.DataFrame) -> None:
         fig.add_hline(y=0.5, line_dash="dash", line_color="white",
                       annotation_text="Coin flip (50%)")
         fig.update_layout(height=280, showlegend=False)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     # Accuracy by edge tier
     if "edge_pct" in verified.columns and verified["edge_pct"].notna().any():
@@ -248,135 +277,146 @@ def _render_prediction_accuracy(preds: pd.DataFrame) -> None:
         edge_acc.columns = ["Accuracy", "Games"]
         edge_acc.index.name = "Edge Tier"
         edge_acc["Accuracy"] = edge_acc["Accuracy"].apply(lambda x: f"{x:.1%}")
-        st.dataframe(edge_acc, width="stretch")
+        st.dataframe(edge_acc, use_container_width=True)
 
-    # Full prediction history
+    # Full prediction history — one row per bet prediction made
     st.markdown("#### Prediction History")
-    st.caption(
-        "Compact view of all predictions: ML (moneyline), RL (run line/spread), and O/U (over/under). "
-        "Each prediction type is highlighted green if correct, red if incorrect. Full row is green if all three correct, red if all three incorrect."
-    )
+    st.caption("One row per bet the model made. Games with multiple bet types (ML, RL, O/U) appear as separate rows.")
 
-    history_cols = [
-        "prediction_date", "away_team", "home_team",
-        "predicted_winner", "home_model_prob", "edge_pct",
-        "best_rl_side", "home_rl", "away_rl",
-        "best_total_direction", "proj_total", "total_line",
-        "correct", "rl_correct", "total_correct",
-    ]
-    present = [c for c in history_cols if c in verified.columns]
-    display = verified[present].copy().reset_index(drop=True)
+    def _result_label(val) -> str:
+        if val == 1:
+            return "✅"
+        if val == 0:
+            return "❌"
+        if val == -1:
+            return "Postponed"
+        return "Pending"
 
-    # Save raw correct values (0/1) before emoji conversion — used for row coloring
-    correct_raw = display["correct"].copy()
-    rl_correct_raw = display.get("rl_correct", pd.Series([None] * len(display))).copy()
-    total_correct_raw = display.get("total_correct", pd.Series([None] * len(display))).copy()
+    rows = []
+    for _, game in all_verified.iterrows():
+        matchup = f"{game['away_team']} @ {game['home_team']}"
+        date = game["prediction_date"]
+        is_postponed = int(game.get("correct", 0) or 0) == -1
 
-    # Build new compact columns
-    new_display = pd.DataFrame()
-    new_display["date"] = display["prediction_date"]
-    new_display["matchup"] = display["away_team"] + " @ " + display["home_team"]
+        # Resolved scores for this game
+        away_score = game.get("actual_away_score")
+        home_score = game.get("actual_home_score")
+        scores_known = pd.notna(away_score) and pd.notna(home_score)
+        final_score = (
+            f"{int(away_score)}-{int(home_score)}" if scores_known else ""
+        )
 
-    # ML: Predicted winner with emoji (✅/❌)
-    ml_emojis = correct_raw.map({1: "✅", 0: "❌", None: "?"})
-    new_display["ML"] = display["predicted_winner"] + " " + ml_emojis
-    new_display["ML edge"] = display["edge_pct"].round(1).astype(str) + "%"
+        # ML — only when model had an edge recommendation (bet_side != PASS)
+        bet_side = game.get("bet_side")
+        if bet_side and str(bet_side).upper() != "PASS" and pd.notna(bet_side):
+            side_upper = str(bet_side).upper()
+            if side_upper == "HOME":
+                bet_team = game["home_team"]
+            elif side_upper == "AWAY":
+                bet_team = game["away_team"]
+            else:
+                bet_team = str(bet_side)
+            if is_postponed:
+                result_val = -1
+                actual_result = "Postponed"
+            else:
+                result_val = _ml_bet_correct(game)
+                actual_winner = game.get("actual_winner", "")
+                actual_result = str(actual_winner) if actual_winner and pd.notna(actual_winner) else ""
+            edge = game.get("edge_pct")
+            rows.append({
+                "Date": date,
+                "Matchup": matchup,
+                "Type": "ML",
+                "Bet": bet_team,
+                "Edge %": round(float(edge), 1) if pd.notna(edge) else None,
+                "Final Score": final_score,
+                "Actual Result": actual_result,
+                "Result": _result_label(result_val),
+                "_correct": result_val,
+            })
 
-    # RL: Predicted side with spread
-    def _fmt_rl(row):
-        side = row.get("best_rl_side")
-        if side is None or (isinstance(side, float) and pd.isna(side)):
-            return "—"
-        if side.upper() == "HOME":
-            spread = row.get("home_rl")
-        else:
-            spread = row.get("away_rl")
-        if spread is None or (isinstance(spread, float) and pd.isna(spread)):
-            return "—"
-        team = row["home_team"] if side.upper() == "HOME" else row["away_team"]
-        spread_str = f"+{spread:.1f}" if float(spread) > 0 else f"{spread:.1f}"
-        return f"{team} {spread_str}"
+        # RL — only when rl_side is set
+        rl_side = game.get("rl_side")
+        if rl_side and pd.notna(rl_side):
+            rl_upper = str(rl_side).upper()
+            spread = game.get("home_rl") if rl_upper == "HOME" else game.get("away_rl")
+            team = game["home_team"] if rl_upper == "HOME" else game["away_team"]
+            if pd.notna(spread):
+                spread_str = f"+{spread:.1f}" if float(spread) > 0 else f"{spread:.1f}"
+                bet_label = f"{team} {spread_str}"
+            else:
+                bet_label = team
+            result_val = -1 if is_postponed else game.get("rl_correct")
+            rl_edge = game.get("rl_edge_pct")
+            if is_postponed:
+                actual_result = "Postponed"
+            elif scores_known:
+                if rl_upper == "HOME":
+                    margin = int(home_score) - int(away_score)
+                else:
+                    margin = int(away_score) - int(home_score)
+                margin_str = f"+{margin}" if margin > 0 else str(margin)
+                actual_result = f"{team.split()[-1]} {margin_str}"
+            else:
+                actual_result = ""
+            rows.append({
+                "Date": date,
+                "Matchup": matchup,
+                "Type": "RL",
+                "Bet": bet_label,
+                "Edge %": round(float(rl_edge), 1) if pd.notna(rl_edge) else None,
+                "Final Score": final_score,
+                "Actual Result": actual_result,
+                "Result": _result_label(result_val),
+                "_correct": result_val,
+            })
 
-    rl_emojis = rl_correct_raw.map({1: "✅", 0: "❌", None: "?"})
-    new_display["RL"] = display.apply(_fmt_rl, axis=1) + " " + rl_emojis
+        # O/U — only when total_direction is set
+        total_dir = game.get("total_direction")
+        if total_dir and pd.notna(total_dir):
+            proj = game.get("proj_total")
+            line = game.get("total_line")
+            ref = proj if pd.notna(proj) else line
+            bet_label = f"{total_dir} {ref:.1f}" if ref is not None and pd.notna(ref) else str(total_dir)
+            result_val = -1 if is_postponed else game.get("total_correct")
+            ou_edge = game.get("total_edge_pct")
+            if is_postponed:
+                actual_result = "Postponed"
+            elif scores_known:
+                actual_total = int(away_score) + int(home_score)
+                actual_result = f"{actual_total} runs"
+            else:
+                actual_result = ""
+            rows.append({
+                "Date": date,
+                "Matchup": matchup,
+                "Type": "O/U",
+                "Bet": bet_label,
+                "Edge %": round(float(ou_edge), 1) if pd.notna(ou_edge) else None,
+                "Final Score": final_score,
+                "Actual Result": actual_result,
+                "Result": _result_label(result_val),
+                "_correct": result_val,
+            })
 
-    # RL edge — if available in the data
-    if "rl_edge_pct" in verified.columns:
-        rl_edge = verified["rl_edge_pct"].round(1).astype(str) + "%"
-    else:
-        rl_edge = "—"
-    new_display["RL edge"] = rl_edge
+    if not rows:
+        st.info("No bet predictions recorded yet.")
+        return
 
-    # O/U: Direction + projected total
-    def _fmt_ou(row):
-        direction = row.get("best_total_direction")
-        total = row.get("proj_total")
-        if direction is None or (isinstance(direction, float) and pd.isna(direction)):
-            return "—"
-        if total is None or (isinstance(total, float) and pd.isna(total)):
-            return direction
-        return f"{direction} {total:.1f}"
+    hist_df = pd.DataFrame(rows)
+    correct_col = hist_df.pop("_correct")
 
-    ou_emojis = total_correct_raw.map({1: "✅", 0: "❌", None: "?"})
-    new_display["O/U"] = display.apply(_fmt_ou, axis=1) + " " + ou_emojis
-
-    # O/U edge — if available in the data
-    if "total_edge_pct" in verified.columns:
-        ou_edge = verified["total_edge_pct"].round(1).astype(str) + "%"
-    else:
-        ou_edge = "—"
-    new_display["O/U edge"] = ou_edge
-
-    # Add Home Prob as additional prediction info
-    new_display["Home Prob"] = (display["home_model_prob"] * 100).round(1).astype(str) + "%"
-
-    display = new_display.reset_index(drop=True)
-
-    def _row_highlight(row):
-        """
-        Apply cell-level or row-level highlighting:
-        - Green row if all three predictions (ML, RL, O/U) are correct
-        - Red row if all three predictions are incorrect
-        - Otherwise, green/red individual cells based on their prediction type
-        """
-        row_idx = row.name
-        ml = correct_raw.iloc[row_idx] if row_idx < len(correct_raw) else None
-        rl = rl_correct_raw.iloc[row_idx] if row_idx < len(rl_correct_raw) else None
-        ou = total_correct_raw.iloc[row_idx] if row_idx < len(total_correct_raw) else None
-
-        # Check if all three are either correct (1) or incorrect (0)
-        all_correct = ml == 1 and rl == 1 and ou == 1
-        all_incorrect = ml == 0 and rl == 0 and ou == 0
-
-        if all_correct:
+    def _highlight_row(row):
+        val = correct_col.iloc[row.name]
+        if val == 1:
             return ["background-color: #0d2b0d"] * len(row)
-        elif all_incorrect:
+        if val == 0:
             return ["background-color: #2b0d0d"] * len(row)
+        return [""] * len(row)
 
-        # Otherwise, highlight cells by prediction type
-        styles = []
-        for col_name in row.index:
-            bg = ""
-            if col_name in ["ML", "ML edge"]:  # ML prediction columns
-                if ml == 1:
-                    bg = "background-color: #0d2b0d"
-                elif ml == 0:
-                    bg = "background-color: #2b0d0d"
-            elif col_name in ["RL", "RL edge"]:  # RL prediction columns
-                if rl == 1:
-                    bg = "background-color: #0d2b0d"
-                elif rl == 0:
-                    bg = "background-color: #2b0d0d"
-            elif col_name in ["O/U", "O/U edge"]:  # O/U prediction columns
-                if ou == 1:
-                    bg = "background-color: #0d2b0d"
-                elif ou == 0:
-                    bg = "background-color: #2b0d0d"
-            styles.append(bg)
-        return styles
-
-    styled = display.style.apply(_row_highlight, axis=1)
-    st.dataframe(styled, width="stretch", hide_index=True)
+    styled = hist_df.style.apply(_highlight_row, axis=1)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def _render_signal_analysis(preds: pd.DataFrame) -> None:
@@ -387,7 +427,7 @@ def _render_signal_analysis(preds: pd.DataFrame) -> None:
         "win 48% of the time, the model is overconfident and the FIP or Pythagorean weights need tuning."
     )
 
-    verified = preds[preds["correct"].notna()].copy()
+    verified = preds[(preds["correct"].notna()) & (preds["correct"] != -1)].copy()
     if verified.empty or len(verified) < 5:
         st.info("Need at least 5 verified games to analyze signal performance.")
         return
@@ -441,7 +481,7 @@ def _render_signal_analysis(preds: pd.DataFrame) -> None:
             yaxis=dict(tickformat=".0%", range=[0, 1]),
             legend=dict(orientation="h"),
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
@@ -454,7 +494,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
         "picks outperform low-probability ones."
     )
 
-    verified = preds[preds["correct"].notna()].copy()
+    verified = preds[(preds["correct"].notna()) & (preds["correct"] != -1)].copy()
     if verified.empty or len(verified) < 3:
         st.info("Need more verified predictions to show breakdown. Check back after more games complete.")
         return
@@ -471,7 +511,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                .agg(Win=lambda x: int(x.sum()), Games=("count"))
                .reset_index(names="Tier"))
         tbl["Win %"] = (tbl["Win"] / tbl["Games"] * 100).round(1).astype(str) + "%"
-        st.dataframe(tbl, width="stretch", hide_index=True)
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
 
         if len(tbl) > 1:
             fig = px.bar(tbl, x="Tier", y=tbl["Win"] / tbl["Games"],
@@ -483,7 +523,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                           annotation_text="50%")
             fig.update_layout(height=250, showlegend=False,
                                coloraxis_showscale=False, margin=dict(t=10))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
     # ── Bet direction ──────────────────────────────────────────────────────
     with col_b:
@@ -497,7 +537,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                        .agg(Win=lambda x: int(x.sum()), Games=("count"))
                        .reset_index(names="Direction"))
             dir_tbl["Win %"] = (dir_tbl["Win"] / dir_tbl["Games"] * 100).round(1).astype(str) + "%"
-            st.dataframe(dir_tbl, width="stretch", hide_index=True)
+            st.dataframe(dir_tbl, use_container_width=True, hide_index=True)
 
             fig = px.bar(dir_tbl, x="Direction", y=dir_tbl["Win"] / dir_tbl["Games"],
                          text=(dir_tbl["Win"] / dir_tbl["Games"]).apply(lambda x: f"{x:.0%}"),
@@ -508,7 +548,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                           annotation_text="50%")
             fig.update_layout(height=250, showlegend=False,
                                coloraxis_showscale=False, margin=dict(t=10))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
     # ── Model confidence bucket ────────────────────────────────────────────
     with col_c:
@@ -524,7 +564,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                         .agg(Win=lambda x: int(x.sum()), Games=("count"))
                         .reset_index(names="Confidence"))
             conf_tbl["Win %"] = (conf_tbl["Win"] / conf_tbl["Games"] * 100).round(1).astype(str) + "%"
-            st.dataframe(conf_tbl, width="stretch", hide_index=True)
+            st.dataframe(conf_tbl, use_container_width=True, hide_index=True)
 
             fig = px.bar(conf_tbl, x="Confidence",
                          y=conf_tbl["Win"] / conf_tbl["Games"],
@@ -536,7 +576,7 @@ def _render_prediction_type_breakdown(preds: pd.DataFrame) -> None:
                           annotation_text="50%")
             fig.update_layout(height=250, showlegend=False,
                                coloraxis_showscale=False, margin=dict(t=10))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_underdog_analysis(preds: pd.DataFrame) -> None:
@@ -547,7 +587,7 @@ def _render_underdog_analysis(preds: pd.DataFrame) -> None:
         "actually win? Useful for calibrating how much to trust the model against public consensus."
     )
 
-    verified = preds[preds["correct"].notna()].copy()
+    verified = preds[(preds["correct"].notna()) & (preds["correct"] != -1)].copy()
     if verified.empty or len(verified) < 3:
         st.info("Need more verified games to compute underdog stats. Check back after more results come in.")
         return
@@ -622,7 +662,7 @@ def _render_underdog_analysis(preds: pd.DataFrame) -> None:
     if len(bucket_tbl) > 1:
         col_tbl, col_chart = st.columns([1, 2])
         with col_tbl:
-            st.dataframe(bucket_tbl, width="stretch", hide_index=True)
+            st.dataframe(bucket_tbl, use_container_width=True, hide_index=True)
         with col_chart:
             fig = px.bar(
                 bucket_tbl, x="Market Prob",
@@ -637,9 +677,9 @@ def _render_underdog_analysis(preds: pd.DataFrame) -> None:
             fig.add_hline(y=0.5, line_dash="dash", line_color="white", annotation_text="50%")
             fig.update_layout(height=250, showlegend=False, coloraxis_showscale=False,
                               margin=dict(t=30, b=10))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
     else:
-        st.dataframe(bucket_tbl, width="stretch", hide_index=True)
+        st.dataframe(bucket_tbl, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +832,7 @@ def _render_historical_team_stats() -> None:
         font=dict(color="#e0e0e0"),
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     # ── League summary metrics ────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
@@ -807,7 +847,7 @@ def _render_historical_team_stats() -> None:
                        "hr_pg", "k_pg", "runs_pg", "run_diff_pg"]].copy()
         display.columns = ["Team", "W", "L", "Win%", "H/G", "HR/G", "K/G", "R/G", "RDiff/G"]
         display["Win%"] = display["Win%"].apply(lambda x: f"{x:.3f}")
-        st.dataframe(display, width="stretch", hide_index=True)
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
     # ── Current-season run differential leaderboard ───────────────────────
     st.divider()
@@ -857,7 +897,7 @@ def _render_historical_team_stats() -> None:
             paper_bgcolor="#0f0f0f",
             font=dict(color="#e0e0e0"),
         )
-        st.plotly_chart(fig_rd, width="stretch")
+        st.plotly_chart(fig_rd, use_container_width=True)
 
         rd_m1, rd_m2, rd_m3, rd_m4 = st.columns(4)
         rd_m1.metric("League Avg RDiff/G", f"{league_rd_avg:+.2f}")
@@ -892,7 +932,10 @@ def _build_type_stats(log: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
         acc[bt]["PnL"]    += pnl
         acc[bt]["sources"].add(source)
 
-    verified = preds[preds["correct"].notna()].copy() if not preds.empty else pd.DataFrame()
+    verified = (
+        preds[(preds["correct"].notna()) & (preds["correct"] != -1)].copy()
+        if not preds.empty else pd.DataFrame()
+    )
 
     # ── ML from predictions ───────────────────────────────────────────────────
     if not verified.empty:
@@ -907,6 +950,7 @@ def _build_type_stats(log: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
         rl_preds = verified[
             verified["rl_side"].notna() &
             verified["rl_correct"].notna() &
+            (verified["rl_correct"] != -1) &
             (verified["rl_side"] != "PASS")
         ]
         if not rl_preds.empty:
@@ -916,7 +960,8 @@ def _build_type_stats(log: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
     if not verified.empty and "total_direction" in verified.columns and "total_correct" in verified.columns:
         ou_preds = verified[
             verified["total_direction"].notna() &
-            verified["total_correct"].notna()
+            verified["total_correct"].notna() &
+            (verified["total_correct"] != -1)
         ]
         if not ou_preds.empty:
             _add("O/U", len(ou_preds), int(ou_preds["total_correct"].sum()), "Predictions")
@@ -1042,7 +1087,7 @@ def _render_bet_type_analysis(log: pd.DataFrame, preds: pd.DataFrame) -> None:
     )
     c_chart, c_tbl = st.columns([2, 1])
     with c_chart:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with c_tbl:
         display = type_stats[["bet_type", "Bets", "Wins", "Win %", "Source"]].copy()
         display["Win %"] = display["Win %"].apply(lambda x: f"{x:.1%}")
@@ -1050,70 +1095,532 @@ def _render_bet_type_analysis(log: pd.DataFrame, preds: pd.DataFrame) -> None:
         if has_roi:
             display["ROI %"] = type_stats["ROI %"].apply(lambda x: f"{x:+.1f}%")
         display = display.rename(columns={"bet_type": "Type"})
-        st.dataframe(display, width="stretch", hide_index=True)
+        st.dataframe(display, use_container_width=True, hide_index=True)
         st.caption("ML, RL, and O/U win rates use verified model predictions. Logged bets supplement where available.")
 
 
+def _compute_pnl(outcome: str, stake: float, line: int | float) -> float:
+    """Compute profit/loss from outcome, stake, and American line."""
+    if outcome == "Win":
+        return round(stake * line / 100, 2) if line > 0 else round(stake * 100 / abs(line), 2)
+    if outcome == "Loss":
+        return -abs(stake)
+    return 0.0
+
+
 def _render_bet_log_analysis() -> None:
-    st.subheader("Bet Log Analysis")
-    st.caption(
-        "Tracks actual bets you've logged with outcomes. Win rate alone doesn't tell the whole "
-        "story — a 52% win rate at -110 juice breaks even, while a 48% win rate at +150 is "
-        "profitable. ROI is the number that counts. Log bets from the Games page bet slip."
-    )
+    # Auto-settle pending bets whose game date has passed
+    try:
+        from src.data.bet_log_db import settle_pending_bets as _settle
+        n_settled = _settle()
+        if n_settled > 0:
+            st.toast(f"Auto-settled {n_settled} bet(s) from completed games.", icon="✅")
+    except Exception:
+        pass
 
     log = load_bets()
     settled = log[log["outcome"].isin(["Win", "Loss"])].copy() if not log.empty else pd.DataFrame()
 
-    if settled.empty:
-        st.info("No settled bets yet. Log bets with outcomes in the Bet Log tab to see ROI analysis.")
+    if settled.empty and (log.empty or log["outcome"].eq("Pending").all()):
+        st.info("No settled bets yet. Log bets from the Games page bet slip to see analysis here.")
+        _render_log_form(log)
         return
 
-    total_staked = settled["stake"].sum()
-    total_pnl = settled["pnl"].sum()
-    win_rate = (settled["outcome"] == "Win").mean()
-    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0.0
+    if not settled.empty:
+        total_staked = settled["stake"].sum()
+        total_pnl = settled["pnl"].sum()
+        win_rate = (settled["outcome"] == "Win").mean()
+        roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0.0
+        avg_stake = total_staked / len(settled)
+        n_pending = len(log[log["outcome"] == "Pending"]) if not log.empty else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Settled Bets", len(settled))
-    c2.metric("Win Rate", f"{win_rate:.1%}")
-    c3.metric("Total P&L", f"${total_pnl:+,.2f}")
-    c4.metric("ROI", f"{roi:+.1f}%")
+        # Current streak
+        outcomes_sorted = settled.sort_values("date")["outcome"].tolist()
+        last = outcomes_sorted[-1]
+        count = 0
+        for o in reversed(outcomes_sorted):
+            if o == last:
+                count += 1
+            else:
+                break
+        icon = "🔥" if last == "Win" else "❄️"
+        streak_str = f"{icon} {count}{'W' if last == 'Win' else 'L'}"
 
-    # ROI by signal type
-    if "signal_type" in settled.columns and settled["signal_type"].notna().any():
-        st.markdown("#### ROI by Signal Type")
-        st.caption("Which model signals actually produce profit? A signal with high win rate but negative ROI means you're winning on the wrong side of the juice. A signal with lower win rate but positive ROI means you're getting paid well when you win.")
-        sig_df = compute_signal_roi(settled.dropna(subset=["signal_type"]))
-        if not sig_df.empty:
-            st.dataframe(
-                sig_df.rename(columns={
-                    "signal_type": "Signal", "bets": "Bets", "win_rate": "Win Rate",
-                    "total_staked": "Staked ($)", "total_pnl": "P&L ($)", "roi_pct": "ROI%",
-                }),
-                width="stretch", hide_index=True,
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Settled Bets", len(settled))
+        k2.metric("Win Rate", f"{win_rate:.1%}")
+        k3.metric("Total P&L", f"${total_pnl:+,.2f}")
+        k4.metric("ROI", f"{roi:+.1f}%")
+        k5.metric("Avg Stake", f"${avg_stake:,.0f}")
+        k6.metric("Streak / Pending", f"{streak_str}  ·  {n_pending}⏳")
+
+        st.divider()
+
+        # ── ROI by Signal Type ────────────────────────────────────────────────
+        if "signal_type" in settled.columns and settled["signal_type"].notna().any():
+            st.markdown("#### ROI by Signal Type")
+            st.caption(
+                "Which model signals actually produce profit? A signal with high win rate but "
+                "negative ROI means you're winning on the wrong side of the juice."
+            )
+            sig_df = compute_signal_roi(settled.dropna(subset=["signal_type"]))
+            if not sig_df.empty:
+                st.dataframe(
+                    sig_df.rename(columns={
+                        "signal_type": "Signal", "bets": "Bets", "win_rate": "Win Rate",
+                        "total_staked": "Staked ($)", "total_pnl": "P&L ($)", "roi_pct": "ROI%",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+
+        # ── Model Calibration ─────────────────────────────────────────────────
+        with_prob = settled.dropna(subset=["model_prob"])
+        if not with_prob.empty:
+            st.markdown("#### Model Calibration")
+            st.caption(
+                "Compares the model's stated win probability against what actually happened. "
+                "A well-calibrated model shows actual win rate ≈ expected win rate in each bucket."
+            )
+            cal_df = compute_calibration_table(with_prob)
+            if not cal_df.empty:
+                st.dataframe(
+                    cal_df.rename(columns={
+                        "bucket": "Prob Bucket", "bets": "Bets",
+                        "expected_win_rate": "Expected Win%", "actual_win_rate": "Actual Win%",
+                        "calibration_error": "Error", "total_staked": "Staked ($)",
+                        "total_pnl": "P&L ($)", "roi_pct": "ROI%",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                st.markdown("#### Tuning Suggestions")
+                st.caption("Automated recommendations based on calibration error. Apply judgment before changing any model constants.")
+                for s in recommend_threshold_adjustments(cal_df):
+                    st.write(f"- {s}")
+
+        st.divider()
+
+        # ── Charts ────────────────────────────────────────────────────────────
+        chart_col1, chart_col2 = st.columns([3, 2])
+
+        with chart_col1:
+            st.markdown("#### Cumulative P&L")
+            cum = (
+                settled.sort_values("date")
+                .assign(cumulative_pnl=lambda d: d["pnl"].cumsum())
+                .reset_index(drop=True)
+            )
+            cum["label"] = cum["date"].astype(str) + " · " + cum["matchup"].fillna("")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(range(len(cum))),
+                y=cum["cumulative_pnl"],
+                mode="lines+markers",
+                line=dict(color="#2ecc71" if total_pnl >= 0 else "#e74c3c", width=2),
+                marker=dict(
+                    color=cum["outcome"].map({"Win": "#2ecc71", "Loss": "#e74c3c"}),
+                    size=7,
+                ),
+                hovertext=cum["label"],
+                hoverinfo="text+y",
+                name="Cumulative P&L",
+            ))
+            fig.add_hline(y=0, line_dash="dash", line_color="#555")
+            fig.update_layout(
+                height=240,
+                margin=dict(l=0, r=0, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showticklabels=False, showgrid=False),
+                yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with chart_col2:
+            st.markdown("#### P&L by Bet Type")
+            if "bet_type" in settled.columns and settled["bet_type"].notna().any():
+                type_df = (
+                    settled.groupby("bet_type")
+                    .agg(pnl=("pnl", "sum"), bets=("pnl", "count"))
+                    .reset_index()
+                )
+                colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in type_df["pnl"]]
+                fig2 = go.Figure(go.Bar(
+                    x=type_df["bet_type"],
+                    y=type_df["pnl"],
+                    marker_color=colors,
+                    text=[f"${v:+,.0f}" for v in type_df["pnl"]],
+                    textposition="outside",
+                    customdata=type_df["bets"],
+                    hovertemplate="%{x}<br>P&L: $%{y:+,.2f}<br>Bets: %{customdata}<extra></extra>",
+                ))
+                fig2.update_layout(
+                    height=240,
+                    margin=dict(l=0, r=0, t=10, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.caption("No bet type data.")
+
+        row2_col1, row2_col2 = st.columns([3, 2])
+
+        with row2_col1:
+            st.markdown("#### Monthly P&L")
+            settled["month"] = pd.to_datetime(settled["date"], errors="coerce").dt.to_period("M").astype(str)
+            monthly = (
+                settled.groupby("month")
+                .agg(pnl=("pnl", "sum"), bets=("pnl", "count"), wins=("outcome", lambda x: (x == "Win").sum()))
+                .reset_index()
+            )
+            monthly["win_rate"] = monthly["wins"] / monthly["bets"] * 100
+            bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in monthly["pnl"]]
+            fig3 = go.Figure(go.Bar(
+                x=monthly["month"],
+                y=monthly["pnl"],
+                marker_color=bar_colors,
+                text=[f"${v:+,.0f}" for v in monthly["pnl"]],
+                textposition="outside",
+                customdata=list(zip(monthly["bets"], monthly["win_rate"])),
+                hovertemplate="%{x}<br>P&L: $%{y:+,.2f}<br>Bets: %{customdata[0]}<br>Win rate: %{customdata[1]:.1f}%<extra></extra>",
+            ))
+            fig3.add_hline(y=0, line_dash="dash", line_color="#555")
+            fig3.update_layout(
+                height=220,
+                margin=dict(l=0, r=0, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+
+        with row2_col2:
+            st.markdown("#### Outcome Distribution")
+            outcome_counts = settled["outcome"].value_counts().reset_index()
+            outcome_counts.columns = ["Outcome", "Count"]
+            fig4 = go.Figure(go.Pie(
+                labels=outcome_counts["Outcome"],
+                values=outcome_counts["Count"],
+                hole=0.55,
+                marker_colors=["#2ecc71" if o == "Win" else "#e74c3c" for o in outcome_counts["Outcome"]],
+                textinfo="label+percent",
+                hovertemplate="%{label}: %{value} bets (%{percent})<extra></extra>",
+            ))
+            fig4.update_layout(
+                height=220,
+                margin=dict(l=0, r=0, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+
+        # ── Recent form strip ─────────────────────────────────────────────────
+        st.markdown("#### Recent Form")
+        recent = settled.sort_values("date").tail(10)
+        cols = st.columns(len(recent))
+        for col, (_, row) in zip(cols, recent.iterrows()):
+            color = "#2ecc71" if row["outcome"] == "Win" else "#e74c3c"
+            pnl_sign = "+" if row["pnl"] >= 0 else ""
+            col.markdown(
+                f'<div style="background:{color};border-radius:6px;padding:6px 4px;text-align:center">'
+                f'<div style="font-weight:bold;font-size:13px;color:#000">{row["outcome"][0]}</div>'
+                f'<div style="font-size:10px;color:#000">{pnl_sign}${row["pnl"]:.0f}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
 
-    # Calibration
-    with_prob = settled.dropna(subset=["model_prob"])
-    if not with_prob.empty:
-        st.markdown("#### Model Calibration (Bet Log)")
-        st.caption("Compares the model's stated win probability against what actually happened on bets you logged. A well-calibrated model shows actual win rate ≈ expected win rate in each bucket. Large gaps mean the model probabilities need adjustment.")
-        cal_df = compute_calibration_table(with_prob)
-        if not cal_df.empty:
-            st.dataframe(
-                cal_df.rename(columns={
-                    "bucket": "Prob Bucket", "bets": "Bets",
-                    "expected_win_rate": "Expected Win%", "actual_win_rate": "Actual Win%",
-                    "calibration_error": "Error", "total_staked": "Staked ($)",
-                    "total_pnl": "P&L ($)", "roi_pct": "ROI%",
-                }),
-                width="stretch", hide_index=True,
+        st.divider()
+
+    # ── Log form + history ────────────────────────────────────────────────────
+    _render_log_form(log)
+
+
+def _parlay_combined_american(legs_df: pd.DataFrame) -> int | None:
+    """Convert each leg's American line to decimal, multiply, convert back to American."""
+    combined = 1.0
+    for _, leg in legs_df.iterrows():
+        lv = float(leg.get("line") or -110)
+        combined *= (lv / 100 + 1) if lv > 0 else (100 / abs(lv) + 1)
+    if combined <= 1.0:
+        return None
+    return round((combined - 1) * 100) if combined >= 2.0 else round(-100 / (combined - 1))
+
+
+def _build_log_display(log: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the editable display DataFrame.
+    Singles → one row each.
+    Parlays → one row: matchup = comma-separated games, bet = leg descriptions,
+              line = combined American odds, edge % = blank.
+    _single_id / _parlay_id are hidden routing keys; 'select' is the checkbox column.
+    """
+    rows = []
+    seen_parlays: set = set()
+    for _, row in log.iterrows():
+        bet_type = str(row.get("bet_type") or "Single")
+        if bet_type != "Parlay":
+            rows.append({
+                "select":      False,
+                "date":        row.get("date", ""),
+                "type":        "Single",
+                "matchup":     row.get("matchup", ""),
+                "bet":         str(row.get("bet_side", "")),
+                "line":        row.get("line"),
+                "stake":       float(row.get("stake") or 0),
+                "edge %":      row.get("edge_pct"),
+                "outcome":     row.get("outcome", "Pending"),
+                "pnl":         float(row.get("pnl") or 0),
+                "_single_id":  int(row.get("id", 0)),
+                "_parlay_id":  None,
+            })
+        else:
+            pid_raw = row.get("parlay_id")
+            if pid_raw is None or pd.isna(pid_raw):
+                continue
+            pid_key = float(pid_raw)
+            if pid_key in seen_parlays:
+                continue
+            seen_parlays.add(pid_key)
+            legs = log[log["parlay_id"] == pid_key].sort_values("id")
+            total_stake  = float(
+                next((l["stake"] for _, l in legs.iterrows() if float(l.get("stake") or 0) > 0), 0)
             )
-            st.markdown("#### Tuning Suggestions")
-            st.caption("Automated recommendations based on calibration error. These are starting points — apply judgment before changing any model constants.")
-            for s in recommend_threshold_adjustments(cal_df):
-                st.write(f"- {s}")
+            total_pnl    = float(legs["pnl"].fillna(0).sum())
+            outcome      = str(legs.iloc[0]["outcome"])
+            matchup_str  = ", ".join(str(l.get("matchup", "")) for _, l in legs.iterrows())
+            bet_str      = "  |  ".join(str(l.get("bet_side", "")) for _, l in legs.iterrows())
+            combined_line = _parlay_combined_american(legs)
+            rows.append({
+                "select":      False,
+                "date":        legs.iloc[0].get("date", ""),
+                "type":        f"Parlay ({len(legs)} legs)",
+                "matchup":     matchup_str,
+                "bet":         bet_str,
+                "line":        combined_line,
+                "stake":       total_stake,
+                "edge %":      None,
+                "outcome":     outcome,
+                "pnl":         total_pnl,
+                "_single_id":  None,
+                "_parlay_id":  pid_key,
+            })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def _save_log_edits(edited: pd.DataFrame, original: pd.DataFrame) -> None:
+    """
+    Persist changes from the editable display DataFrame back to the bet log DB.
+    Parlays are updated via update_parlay; all other rows are rebuilt and saved via save_all.
+    """
+    all_db_rows: list[dict] = []
+
+    for _, row in edited.iterrows():
+        parlay_id_val = row.get("_parlay_id")
+        single_id_val = row.get("_single_id")
+
+        if pd.notna(parlay_id_val):
+            # Parlay: reconstruct all legs with the new outcome + stake
+            orig_legs = original[original["parlay_id"] == float(parlay_id_val)].sort_values("id")
+            if orig_legs.empty:
+                continue
+            new_outcome = str(row.get("outcome", "Pending"))
+            new_stake   = float(row.get("stake") or 0)
+
+            combined = 1.0
+            for _, leg in orig_legs.iterrows():
+                lv = float(leg.get("line") or -110)
+                combined *= (lv / 100 + 1) if lv > 0 else (100 / abs(lv) + 1)
+
+            if new_outcome == "Win":
+                pnl = round(new_stake * (combined - 1), 2)
+            elif new_outcome == "Loss":
+                pnl = -abs(new_stake)
+            else:
+                pnl = 0.0
+
+            for i, (_, leg) in enumerate(orig_legs.iterrows()):
+                d = leg.to_dict()
+                d["outcome"] = new_outcome
+                d["stake"]   = new_stake if i == 0 else 0.0
+                d["pnl"]     = pnl       if i == 0 else 0.0
+                all_db_rows.append(d)
+
+        elif pd.notna(single_id_val):
+            orig = original[original["id"] == int(single_id_val)]
+            if orig.empty:
+                continue
+            d = orig.iloc[0].to_dict()
+            d["outcome"]  = str(row.get("outcome", d["outcome"]))
+            d["stake"]    = float(row.get("stake") or d.get("stake") or 0)
+            if pd.notna(row.get("line")):
+                d["line"] = float(row["line"])
+            if pd.notna(row.get("edge %")):
+                d["edge_pct"] = float(row["edge %"])
+            if pd.notna(row.get("matchup")):
+                d["matchup"] = str(row["matchup"])
+            d["pnl"] = (
+                _compute_pnl(d["outcome"], d["stake"], d.get("line") or -110)
+                if d["outcome"] != "Pending" else 0.0
+            )
+            all_db_rows.append(d)
+
+    if all_db_rows:
+        save_all(pd.DataFrame(all_db_rows))
+
+
+def _delete_selected(edited: pd.DataFrame, original: pd.DataFrame) -> None:
+    """Remove all DB rows associated with checked display rows."""
+    selected = edited[edited.get("select", False) == True] if "select" in edited.columns else pd.DataFrame()
+    if selected.empty:
+        return
+    ids_to_drop: set[int] = set()
+    for _, row in selected.iterrows():
+        sid = row.get("_single_id")
+        pid = row.get("_parlay_id")
+        if pd.notna(sid):
+            ids_to_drop.add(int(sid))
+        if pd.notna(pid):
+            for bid in original[original["parlay_id"] == float(pid)]["id"]:
+                ids_to_drop.add(int(bid))
+    remaining = original[~original["id"].isin(ids_to_drop)]
+    save_all(remaining)
+
+
+def _render_log_form(log: pd.DataFrame) -> None:
+    """Render the add-bet form and the unified editable bet history table."""
+    with st.expander("+ Log a New Bet", expanded=False):
+        with st.form("new_bet_analysis"):
+            col1, col2 = st.columns(2)
+            with col1:
+                date = st.date_input("Date")
+                matchup = st.text_input("Matchup (e.g. NYY @ BOS)")
+                bet_side = st.text_input("Bet side (team name)")
+                line = st.number_input("American line (e.g. -110, +130)", value=-110, step=5)
+                model_prob = st.number_input(
+                    "Model win probability % (from Games page)",
+                    min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                )
+            with col2:
+                stake = st.number_input("Stake ($)", min_value=1.0, value=50.0, step=10.0)
+                edge_pct = st.number_input("Edge % at time of bet", value=0.0, step=0.1)
+                signal_type = st.selectbox("Signal that triggered bet", SIGNAL_TYPES)
+                outcome = st.selectbox("Outcome", OUTCOMES)
+                notes = st.text_input("Notes (optional)")
+
+            submitted = st.form_submit_button("Log Bet")
+
+        if submitted:
+            pnl = _compute_pnl(outcome, stake, line) if outcome != "Pending" else 0.0
+            insert_bet({
+                "date": str(date),
+                "matchup": matchup,
+                "bet_side": bet_side,
+                "line": line,
+                "stake": stake,
+                "edge_pct": edge_pct,
+                "model_prob": round(model_prob / 100, 4) if model_prob > 0 else None,
+                "signal_type": signal_type,
+                "outcome": outcome,
+                "pnl": pnl,
+                "notes": notes,
+            })
+            st.success(f"Bet logged: {bet_side} ({matchup})")
+            st.rerun()
+
+    if log.empty:
+        return
+
+    st.subheader("Bet History")
+    st.caption("Check a row to select it, then use **Delete Selected** to remove. Edit cells directly and click **Save Changes** to persist.")
+
+    disp = _build_log_display(log)
+    if disp.empty:
+        return
+
+    edited = st.data_editor(
+        disp,
+        column_order=["select", "date", "type", "matchup", "bet", "line", "stake", "edge %", "outcome", "pnl"],
+        column_config={
+            "select":  st.column_config.CheckboxColumn("", width="small"),
+            "date":    st.column_config.TextColumn("Date"),
+            "type":    st.column_config.TextColumn("Type", disabled=True),
+            "matchup": st.column_config.TextColumn("Matchup", disabled=True),
+            "bet":     st.column_config.TextColumn("Bet / Legs", disabled=True),
+            "line":    st.column_config.NumberColumn("Line", format="%d"),
+            "stake":   st.column_config.NumberColumn("Stake ($)", format="%.2f"),
+            "edge %":  st.column_config.NumberColumn("Edge %", format="%.1f"),
+            "outcome": st.column_config.SelectboxColumn("Outcome", options=OUTCOMES),
+            "pnl":     st.column_config.NumberColumn("P&L ($)", format="%.2f", disabled=True),
+        },
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+    )
+
+    btn_col1, btn_col2, _ = st.columns([1, 1, 5])
+    with btn_col1:
+        if st.button("💾 Save Changes", key="log_save_all"):
+            _save_log_edits(edited, log)
+            st.success("Saved.")
+            st.rerun()
+    with btn_col2:
+        n_selected = int(edited["select"].sum()) if "select" in edited.columns else 0
+        if st.button(f"🗑 Delete Selected ({n_selected})", key="log_delete_selected", disabled=n_selected == 0):
+            _delete_selected(edited, log)
+            st.success(f"Deleted {n_selected} row(s).")
+            st.rerun()
+
+    # ── Convert selected singles to a parlay ──────────────────────────────────
+    if "select" in edited.columns:
+        sel = edited[edited["select"] == True]
+        sel_singles = sel[sel["_parlay_id"].isna() & sel["_single_id"].notna()]
+        n_sel = len(sel_singles)
+    else:
+        sel_singles = pd.DataFrame()
+        n_sel = 0
+
+    if n_sel >= 2:
+        st.divider()
+        st.markdown(f"**{n_sel} singles selected — save as a parlay?**")
+        pc1, pc2 = st.columns([2, 5])
+        with pc1:
+            parlay_stake = st.number_input(
+                "Total Parlay Stake ($)", min_value=1.0, value=50.0, step=5.0,
+                key="convert_parlay_stake",
+            )
+        with pc2:
+            leg_preview = "  ·  ".join(
+                str(r.get("bet", "")) for _, r in sel_singles.iterrows()
+            )
+            st.caption(f"Legs: {leg_preview}")
+            if st.button(f"Save as {n_sel}-Leg Parlay", key="btn_convert_parlay"):
+                ids = [int(r["_single_id"]) for _, r in sel_singles.iterrows()]
+                orig = log[log["id"].isin(ids)].sort_values("id")
+                legs = [
+                    {
+                        "date":        str(row.get("date", "")),
+                        "matchup":     str(row.get("matchup", "")),
+                        "bet_side":    str(row.get("bet_side", "")),
+                        "line":        row.get("line"),
+                        "edge_pct":    row.get("edge_pct"),
+                        "model_prob":  row.get("model_prob"),
+                        "signal_type": row.get("signal_type"),
+                        "outcome":     "Pending",
+                        "notes":       str(row.get("notes", "") or ""),
+                    }
+                    for _, row in orig.iterrows()
+                ]
+                save_all(log[~log["id"].isin(ids)])
+                insert_parlay(legs, total_stake=parlay_stake)
+                st.success(f"Saved as a {n_sel}-leg parlay · Stake: ${parlay_stake:.2f}")
+                st.rerun()
+
 
 
 def render() -> None:
@@ -1128,7 +1635,7 @@ def render() -> None:
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Prediction Accuracy", "Prediction Type Win%", "Bet Type Comparison",
-        "Historical Team Stats", "Signal Analysis", "Bet Log ROI",
+        "Historical Team Stats", "Signal Analysis", "Bet Log",
     ])
 
     with tab1:
@@ -1177,9 +1684,4 @@ def render() -> None:
         _render_signal_analysis(preds)
 
     with tab6:
-        st.caption(
-            "Actual P&L tracking on logged bets. Win rate, ROI by signal type, and model "
-            "calibration versus real outcomes. This is the ground truth — did the edge translate "
-            "to profit? Use ROI by signal type to decide which signals to trust more or less."
-        )
         _render_bet_log_analysis()

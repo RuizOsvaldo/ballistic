@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-DB_PATH = Path("data/bet_log.db")
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "bet_log.db"
 
 COLUMNS = [
     "id", "date", "matchup", "bet_side", "line", "stake", "edge_pct",
@@ -94,21 +94,69 @@ def insert_bet(row: dict) -> None:
         conn.execute(sql, values)
 
 
-def insert_parlay(legs: list[dict]) -> None:
-    """Log multiple bets sharing the same auto-generated parlay_id."""
+def insert_parlay(legs: list[dict], total_stake: float | None = None) -> None:
+    """
+    Log a parlay. total_stake is the single amount wagered on the whole parlay.
+    The first leg carries the stake and P&L; all other legs have stake=0.
+    """
     if not legs:
         return
     import time
     parlay_id = int(time.time())
     _init()
     with _connect() as conn:
-        for leg in legs:
+        for i, leg in enumerate(legs):
             row = {**leg, "bet_type": "Parlay", "parlay_id": parlay_id}
+            if total_stake is not None:
+                row["stake"] = float(total_stake) if i == 0 else 0.0
             cols = [c for c in COLUMNS if c != "id" and c in row]
             placeholders = ", ".join(["?" for _ in cols])
             conn.execute(
                 f"INSERT INTO bets ({', '.join(cols)}) VALUES ({placeholders})",
                 [row[c] for c in cols],
+            )
+
+
+def update_parlay(parlay_id: int, outcome: str, total_stake: float) -> None:
+    """
+    Update outcome + stake/P&L for every leg of a parlay.
+    First leg gets total_stake and the calculated P&L; all other legs get stake=0, pnl=0.
+    """
+    _init()
+
+    def _decimal(line: float) -> float:
+        return (line / 100 + 1) if line > 0 else (100 / abs(line) + 1)
+
+    with _connect() as conn:
+        legs = pd.read_sql_query(
+            "SELECT * FROM bets WHERE parlay_id = ? ORDER BY id ASC",
+            conn, params=(parlay_id,),
+        )
+    if legs.empty:
+        return
+
+    combined = 1.0
+    for _, leg in legs.iterrows():
+        combined *= _decimal(float(leg.get("line") or -110))
+
+    if outcome == "Win":
+        pnl = round(total_stake * (combined - 1), 2)
+    elif outcome == "Loss":
+        pnl = -abs(total_stake)
+    else:
+        pnl = 0.0
+
+    with _connect() as conn:
+        conn.execute("UPDATE bets SET outcome = ? WHERE parlay_id = ?", (outcome, parlay_id))
+        first_id = int(legs.iloc[0]["id"])
+        conn.execute(
+            "UPDATE bets SET stake = ?, pnl = ? WHERE id = ?",
+            (float(total_stake), pnl, first_id),
+        )
+        for _, leg in legs.iloc[1:].iterrows():
+            conn.execute(
+                "UPDATE bets SET stake = 0.0, pnl = 0.0 WHERE id = ?",
+                (int(leg["id"]),),
             )
 
 

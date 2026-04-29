@@ -81,8 +81,8 @@ def _load_games() -> pd.DataFrame:
             odds[col] = None if "starter" in col else False
 
     def _ls(row) -> str:
-        h = bool(row.get("home_starter_announced"))
-        a = bool(row.get("away_starter_announced"))
+        h = isinstance(row.get("home_starter"), str) and bool(row.get("home_starter"))
+        a = isinstance(row.get("away_starter"), str) and bool(row.get("away_starter"))
         return "Full" if h and a else "Partial" if h or a else "None"
 
     odds["lineup_status"] = odds.apply(_ls, axis=1)

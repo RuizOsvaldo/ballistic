@@ -23,7 +23,7 @@ from src.models.player_props import (
     MIN_PROP_EDGE_PCT,
 )
 from src.shared.groq_agent import analyze_mlb_prop
-from src.dashboard.pages.games import _add_to_slip
+from src.dashboard.sections.games import _add_to_slip
 
 CURRENT_SEASON = datetime.datetime.now().year
 
@@ -229,7 +229,7 @@ def _render_pitcher_props(pitcher_df: pd.DataFrame) -> None:
 
         st.dataframe(
             edge_df.style.map(_color, subset=["Signal"]),
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
         )
 
@@ -489,7 +489,7 @@ def _render_batter_props(batter_df: pd.DataFrame, pitcher_df: pd.DataFrame) -> N
 
     st.dataframe(
         top10_display.style.map(_style_signal, subset=["BABIP Signal"]),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
     )
 
@@ -638,7 +638,7 @@ def _render_batter_props(batter_df: pd.DataFrame, pitcher_df: pd.DataFrame) -> N
         },
         disabled=[c for c in display_df.columns if c != "Select"],
         hide_index=True,
-        width="stretch",
+        use_container_width=True,
     )
 
     if st.button("📌 Add Selected to Slip", type="primary"):

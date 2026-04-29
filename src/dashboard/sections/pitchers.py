@@ -75,7 +75,7 @@ def render(pitcher_stats: pd.DataFrame) -> None:
                       line=dict(dash="dash", color="grey"))
         fig.update_traces(textposition="top center", marker=dict(size=8))
         fig.update_layout(height=400)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     # ---- Stats table ----
     st.subheader("Pitcher Stats Table")
@@ -99,7 +99,7 @@ def render(pitcher_stats: pd.DataFrame) -> None:
         if col in display_df.columns:
             display_df[col] = display_df[col].round(3)
 
-    st.dataframe(display_df, width="stretch", hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # ---- Signal cards ----
     if "signal_severity" in df.columns:

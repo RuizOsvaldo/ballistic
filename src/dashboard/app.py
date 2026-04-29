@@ -32,6 +32,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+[data-testid="stSidebar"] {
+    background-color: #4a0000;
+}
+[data-testid="stSidebar"] .stSelectbox label,
+[data-testid="stSidebar"] .stNumberInput label,
+[data-testid="stSidebar"] .stButton button,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] small {
+    color: #f0d0d0 !important;
+}
+[data-testid="stSidebarNav"] a span {
+    color: #f0d0d0 !important;
+}
+[data-testid="stSidebarNav"] a[aria-current="page"] span {
+    color: #ffffff !important;
+    font-weight: 700;
+}
+</style>
+""", unsafe_allow_html=True)
+
 CURRENT_SEASON = datetime.datetime.now().year
 
 # ---------------------------------------------------------------------------
@@ -103,10 +126,10 @@ def load_games_data(team_stats: pd.DataFrame, pitcher_stats: pd.DataFrame, bankr
             odds_with_starters["home_starter_announced"] = False
             odds_with_starters["away_starter_announced"] = False
 
-        # Tag lineup status
+        # Tag lineup status — use actual starter name as ground truth (NaN announced flag = True in Python)
         def _lineup_status(row) -> str:
-            h = bool(row.get("home_starter_announced"))
-            a = bool(row.get("away_starter_announced"))
+            h = isinstance(row.get("home_starter"), str) and bool(row.get("home_starter"))
+            a = isinstance(row.get("away_starter"), str) and bool(row.get("away_starter"))
             if h and a:
                 return "Full"
             if h or a:
@@ -161,58 +184,212 @@ def _fmt_american(val) -> str:
 
 @st.dialog("Review & Submit Bets")
 def _bet_slip_submit_dialog(slip: list, today_str: str) -> None:
-    """Modal showing each bet with editable odds/stake before saving."""
-    st.markdown(f"**{len(slip)} bet(s) — adjust odds to match your book before saving**")
+    """Modal — choose side, edit odds/stake, then save as singles, parlay, or both."""
+    st.markdown(f"**{len(slip)} bet(s) — choose side, adjust odds to match your book**")
     st.divider()
 
-    # Build a mutable copy so edits in the form persist within this dialog
     edited = []
     for i, bet in enumerate(slip):
         st.markdown(f"**{bet['matchup']}**")
-        c1, c2, c3 = st.columns([3, 1, 1])
-        with c1:
-            st.caption(bet["description"])
-        with c2:
-            new_odds = st.number_input(
-                "Odds",
-                value=int(bet.get("line") or -110),
-                step=5,
-                key=f"dlg_odds_{i}",
-                help="Edit to match your sportsbook's actual line",
+        bet_type = bet.get("bet_type", "ML")
+
+        if bet_type == "RL":
+            home_t = bet.get("home_team", "")
+            away_t = bet.get("away_team", "")
+            has_side = bool(
+                home_t and away_t
+                and bet.get("home_rl") is not None
+                and bet.get("away_rl") is not None
             )
-        with c3:
-            new_stake = st.number_input(
-                "Stake $",
-                min_value=1.0,
-                value=float(bet.get("stake") or 50.0),
-                step=5.0,
-                key=f"dlg_stake_{i}",
+            cols = st.columns([2, 1, 1, 1])
+            if has_side:
+                with cols[0]:
+                    curr_rl_side = bet.get("rl_side", "HOME")
+                    chosen_rl = st.selectbox(
+                        "Side", [home_t, away_t],
+                        index=0 if curr_rl_side == "HOME" else 1,
+                        key=f"dlg_rl_side_{i}", label_visibility="collapsed",
+                    )
+                    is_home_rl = chosen_rl == home_t
+                    new_rl_side = "HOME" if is_home_rl else "AWAY"
+                    rl_pt_raw = bet.get("home_rl") if is_home_rl else bet.get("away_rl")
+                    rl_pt_val = float(rl_pt_raw) if rl_pt_raw is not None else -1.5
+                    rl_odds_raw = bet.get("home_rl_odds") if is_home_rl else bet.get("away_rl_odds")
+                    rl_odds_def = int(rl_odds_raw) if isinstance(rl_odds_raw, (int, float)) else -110
+            else:
+                chosen_rl = bet.get("rl_team", "")
+                new_rl_side = bet.get("rl_side", "HOME")
+                rl_pt_val = float(bet.get("rl_spread") or -1.5)
+                rl_odds_def = int(bet.get("line") or -110)
+                with cols[0]:
+                    st.caption(bet["description"])
+            with cols[1]:
+                new_spread = st.number_input(
+                    "Spread", value=rl_pt_val, step=0.5,
+                    key=f"dlg_spread_{i}_{new_rl_side}",
+                    help="Adjust run line spread to match your sportsbook",
+                )
+            with cols[2]:
+                new_odds = st.number_input(
+                    "Odds", value=rl_odds_def, step=5,
+                    key=f"dlg_odds_{i}_{new_rl_side}",
+                )
+            with cols[3]:
+                new_stake = st.number_input(
+                    "Stake $", min_value=1.0, value=float(bet.get("stake") or 50.0),
+                    step=5.0, key=f"dlg_stake_{i}",
+                )
+            sign = "+" if new_spread > 0 else ""
+            odds_sign = "+" if int(new_odds) > 0 else ""
+            new_desc = f"RL: {chosen_rl} {sign}{new_spread:.1f} ({odds_sign}{int(new_odds)})"
+            edited.append({
+                **bet,
+                "line": float(new_odds), "stake": float(new_stake),
+                "rl_spread": new_spread, "rl_side": new_rl_side,
+                "rl_team": chosen_rl, "description": new_desc,
+            })
+
+        elif bet_type == "O/U":
+            over_o = bet.get("over_odds")
+            under_o = bet.get("under_odds")
+            has_side = over_o is not None and under_o is not None
+            cols = st.columns([2, 1, 1, 1])
+            if has_side:
+                with cols[0]:
+                    curr_dir = bet.get("ou_direction", "Over")
+                    chosen_dir = st.selectbox(
+                        "Direction", ["Over", "Under"],
+                        index=0 if curr_dir == "Over" else 1,
+                        key=f"dlg_ou_dir_{i}", label_visibility="collapsed",
+                    )
+                    ou_odds_def = int(over_o if chosen_dir == "Over" else under_o)
+            else:
+                chosen_dir = bet.get("ou_direction", "Over")
+                ou_odds_def = int(bet.get("line") or -110)
+                with cols[0]:
+                    st.caption(bet["description"])
+            with cols[1]:
+                new_total = st.number_input(
+                    "Total", value=float(bet.get("ou_total") or 8.5), step=0.5,
+                    key=f"dlg_total_{i}",
+                    help="Adjust O/U line to match your sportsbook",
+                )
+            with cols[2]:
+                new_odds = st.number_input(
+                    "Odds", value=ou_odds_def, step=5,
+                    key=f"dlg_odds_{i}_{chosen_dir}",
+                )
+            with cols[3]:
+                new_stake = st.number_input(
+                    "Stake $", min_value=1.0, value=float(bet.get("stake") or 50.0),
+                    step=5.0, key=f"dlg_stake_{i}",
+                )
+            odds_sign = "+" if int(new_odds) > 0 else ""
+            new_desc = f"{chosen_dir} {new_total:.1f} ({odds_sign}{int(new_odds)})"
+            edited.append({
+                **bet,
+                "line": float(new_odds), "stake": float(new_stake),
+                "ou_total": new_total, "ou_direction": chosen_dir, "description": new_desc,
+            })
+
+        else:  # ML
+            home_t = bet.get("home_team", "")
+            away_t = bet.get("away_team", "")
+            has_side = bool(
+                home_t and away_t
+                and bet.get("home_odds") is not None
+                and bet.get("away_odds") is not None
             )
-        edited.append({**bet, "line": float(new_odds), "stake": float(new_stake)})
+            cols = st.columns([2, 1, 1]) if has_side else st.columns([3, 1, 1])
+            chosen_ml = None
+            new_side = bet.get("bet_side", "HOME")
+            ml_default = int(bet.get("line") or -110)
+            if has_side:
+                with cols[0]:
+                    curr_side = bet.get("bet_side", "HOME")
+                    chosen_ml = st.selectbox(
+                        "Side", [home_t, away_t],
+                        index=0 if curr_side == "HOME" else 1,
+                        key=f"dlg_ml_side_{i}", label_visibility="collapsed",
+                    )
+                    is_home = chosen_ml == home_t
+                    new_side = "HOME" if is_home else "AWAY"
+                    ml_default = int(bet.get("home_odds") if is_home else bet.get("away_odds") or -110)
+            else:
+                with cols[0]:
+                    st.caption(bet["description"])
+            with cols[1]:
+                new_odds = st.number_input(
+                    "Odds", value=ml_default, step=5,
+                    key=f"dlg_odds_{i}_{new_side}",
+                    help="Edit to match your sportsbook's actual line",
+                )
+            with cols[2]:
+                new_stake = st.number_input(
+                    "Stake $", min_value=1.0, value=float(bet.get("stake") or 50.0),
+                    step=5.0, key=f"dlg_stake_{i}",
+                )
+            if has_side and chosen_ml:
+                odds_sign = "+" if int(new_odds) > 0 else ""
+                new_desc = f"ML: {chosen_ml} {odds_sign}{int(new_odds)}"
+            else:
+                new_desc = bet["description"]
+            edited.append({
+                **bet,
+                "line": float(new_odds), "stake": float(new_stake),
+                "bet_side": new_side, "description": new_desc,
+            })
+
         if i < len(slip) - 1:
             st.divider()
 
-    # Parlay preview (uses edited odds)
+    # Parlay preview
+    parlay_total_stake = None
     if len(edited) >= 2:
         st.divider()
         combined_decimal = 1.0
         for bet in edited:
             combined_decimal *= _to_decimal(bet.get("line", -110))
-        total_stake = edited[0].get("stake", 50.0)
-        payout = total_stake * combined_decimal
-        profit = payout - total_stake
+        parlay_total_stake = st.number_input(
+            "Parlay Total Wagered ($)",
+            min_value=1.0,
+            value=float(edited[0].get("stake") or 50.0),
+            step=5.0,
+            key="dlg_parlay_total_stake",
+            help="Single amount wagered on the entire parlay",
+        )
+        payout = parlay_total_stake * combined_decimal
+        profit = payout - parlay_total_stake
         parlay_odds = int((combined_decimal - 1) * 100)
         st.markdown(
             f"**Parlay odds:** +{parlay_odds}  "
             f"| **Payout:** ${payout:,.2f}  |  **Profit:** ${profit:,.2f}"
         )
-        st.caption(f"Based on ${total_stake:.0f} stake on first leg.")
+        st.caption(f"Win: +${profit:,.2f}  ·  Loss: -${parlay_total_stake:,.2f}")
+
+    # Build parlay legs once — shared by Parlay and Both buttons
+    legs = [
+        {
+            "date":        today_str,
+            "matchup":     bet["matchup"],
+            "bet_side":    bet["description"],
+            "line":        bet["line"],
+            "stake":       bet.get("stake", 50.0),
+            "edge_pct":    bet.get("edge_pct", 0),
+            "model_prob":  bet.get("model_prob"),
+            "signal_type": "Multiple",
+            "outcome":     "Pending",
+            "pnl":         0.0,
+        }
+        for bet in edited
+    ]
+    parlay_ok = len(edited) >= 2 and parlay_total_stake is not None
 
     st.divider()
-    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    btn_c1, btn_c2, btn_c3, btn_c4 = st.columns(4)
 
-    with btn_col1:
-        if st.button("✅ Save Singles", type="primary", width="stretch"):
+    with btn_c1:
+        if st.button("✅ Singles", type="primary", width="stretch"):
             for bet in edited:
                 insert_bet({
                     "date":        today_str,
@@ -231,10 +408,17 @@ def _bet_slip_submit_dialog(slip: list, today_str: str) -> None:
             st.success(f"Saved {len(edited)} single bet(s)!")
             st.rerun()
 
-    with btn_col2:
-        if st.button("🔗 Save Parlay", type="primary", width="stretch"):
-            legs = [
-                {
+    with btn_c2:
+        if st.button("🔗 Parlay", type="primary", width="stretch", disabled=not parlay_ok):
+            insert_parlay(legs, total_stake=parlay_total_stake)
+            st.session_state.bet_slip = []
+            st.success(f"Saved {len(legs)}-leg parlay! Total wagered: ${parlay_total_stake:,.2f}")
+            st.rerun()
+
+    with btn_c3:
+        if st.button("💾 Both", type="primary", width="stretch", disabled=not parlay_ok):
+            for bet in edited:
+                insert_bet({
                     "date":        today_str,
                     "matchup":     bet["matchup"],
                     "bet_side":    bet["description"],
@@ -245,15 +429,14 @@ def _bet_slip_submit_dialog(slip: list, today_str: str) -> None:
                     "signal_type": "Multiple",
                     "outcome":     "Pending",
                     "pnl":         0.0,
-                }
-                for bet in edited
-            ]
-            insert_parlay(legs)
+                    "bet_type":    "Single",
+                })
+            insert_parlay(legs, total_stake=parlay_total_stake)
             st.session_state.bet_slip = []
-            st.success(f"Saved {len(legs)}-leg parlay!")
+            st.success(f"Saved {len(edited)} singles + {len(legs)}-leg parlay!")
             st.rerun()
 
-    with btn_col3:
+    with btn_c4:
         if st.button("Cancel", width="stretch"):
             st.rerun()
 
@@ -325,7 +508,7 @@ def _render_bet_slip_sidebar(bankroll: float) -> None:
 
 
 def _render_game_analysis() -> None:
-    from src.dashboard.pages import game_analysis as ga_page
+    from src.dashboard.sections import game_analysis as ga_page
     from src.data.ballpark import get_bullpen_stats as _get_bp
     with st.sidebar:
         st.title("🎯 Ballistic")
@@ -345,7 +528,7 @@ def _render_game_analysis() -> None:
 
 
 def _render_player_analysis() -> None:
-    from src.dashboard.pages import player_analysis as pa_page
+    from src.dashboard.sections import player_analysis as pa_page
     with st.sidebar:
         st.title("🎯 Ballistic")
         st.divider()
@@ -356,13 +539,13 @@ def _render_player_analysis() -> None:
 
 
 def _render_home() -> None:
-    from src.dashboard.pages import games as games_page
-    from src.dashboard.pages import teams as teams_page
-    from src.dashboard.pages import pitchers as pitchers_page
-    from src.dashboard.pages import props as props_page
-    from src.dashboard.pages import preseason as preseason_page
-    from src.dashboard.pages import basketball as basketball_page
-    from src.dashboard.pages import football as football_page
+    from src.dashboard.sections import games as games_page
+    from src.dashboard.sections import teams as teams_page
+    from src.dashboard.sections import pitchers as pitchers_page
+    from src.dashboard.sections import props as props_page
+    from src.dashboard.sections import preseason as preseason_page
+    from src.dashboard.sections import basketball as basketball_page
+    from src.dashboard.sections import football as football_page
 
     with st.sidebar:
         st.title("🎯 Ballistic")
@@ -414,7 +597,7 @@ def _render_home() -> None:
         elif section == "Preseason Projections":
             preseason_page.render()
         elif section == "Game Analysis":
-            from src.dashboard.pages import game_analysis as ga_page
+            from src.dashboard.sections import game_analysis as ga_page
             from src.data.ballpark import get_bullpen_stats as _get_bp
             try:
                 bullpen_df = _get_bp(CURRENT_SEASON)
@@ -423,7 +606,7 @@ def _render_home() -> None:
             games_df, _ = load_games_data(team_stats_df, pitcher_stats_df, bankroll)
             ga_page.render(games_df, team_stats=team_stats_df, pitcher_stats=pitcher_stats_df, bullpen_df=bullpen_df)
         elif section == "Player Analysis":
-            from src.dashboard.pages import player_analysis as pa_page
+            from src.dashboard.sections import player_analysis as pa_page
             pa_page.render()
 
     elif sport == "🏀 Basketball":
@@ -432,16 +615,8 @@ def _render_home() -> None:
         football_page.render(bankroll=bankroll)
 
 
-def _render_bet_log() -> None:
-    from src.dashboard.pages import bet_log as bet_log_page
-    with st.sidebar:
-        st.title("🎯 Ballistic")
-        st.divider()
-    bet_log_page.render()
-
-
 def _render_analysis() -> None:
-    from src.dashboard.pages import analysis as analysis_page
+    from src.dashboard.sections import analysis as analysis_page
     with st.sidebar:
         st.title("🎯 Ballistic")
         st.divider()
@@ -449,7 +624,7 @@ def _render_analysis() -> None:
 
 
 def _render_about() -> None:
-    from src.dashboard.pages import about as about_page
+    from src.dashboard.sections import about as about_page
     with st.sidebar:
         st.title("🎯 Ballistic")
         st.divider()
@@ -463,7 +638,6 @@ def _render_about() -> None:
 pg = st.navigation(
     [
         st.Page(_render_home, title="Home", icon="🏠", default=True),
-        st.Page(_render_bet_log, title="Bet Log", icon="📒"),
         st.Page(_render_analysis, title="Analysis", icon="📊"),
         st.Page(_render_about, title="About", icon="📖"),
     ],

@@ -115,7 +115,7 @@ def _render_dashboard(log: pd.DataFrame) -> None:
             yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
             showlegend=False,
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     with chart_col2:
         st.markdown("#### P&L by Bet Type")
@@ -144,7 +144,7 @@ def _render_dashboard(log: pd.DataFrame) -> None:
                 yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
                 showlegend=False,
             )
-            st.plotly_chart(fig2, width="stretch")
+            st.plotly_chart(fig2, use_container_width=True)
         else:
             st.caption("No bet type data.")
 
@@ -180,7 +180,7 @@ def _render_dashboard(log: pd.DataFrame) -> None:
             yaxis=dict(tickprefix="$", gridcolor="#2a2a2a"),
             showlegend=False,
         )
-        st.plotly_chart(fig3, width="stretch")
+        st.plotly_chart(fig3, use_container_width=True)
 
     with row2_col2:
         st.markdown("#### Outcome Distribution")
@@ -200,7 +200,7 @@ def _render_dashboard(log: pd.DataFrame) -> None:
             paper_bgcolor="rgba(0,0,0,0)",
             showlegend=False,
         )
-        st.plotly_chart(fig4, width="stretch")
+        st.plotly_chart(fig4, use_container_width=True)
 
     # ── Recent form strip (last 10 settled bets) ──────────────────────────────
     st.markdown("#### Recent Form")
@@ -310,7 +310,7 @@ def render() -> None:
             )
 
             styled = display_df.style.apply(_row_color, axis=1)
-            st.dataframe(styled, width="stretch", hide_index=True)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
             # ---- Outcome editor ----
             with st.expander("Edit Outcomes / Save Changes"):
@@ -330,7 +330,7 @@ def render() -> None:
                         "pnl": st.column_config.NumberColumn("P&L ($)", format="$%.2f"),
                         "stake": st.column_config.NumberColumn("Stake ($)", format="$%.2f"),
                     },
-                    width="stretch",
+                    use_container_width=True,
                     hide_index=True,
                     num_rows="dynamic",
                 )
@@ -382,7 +382,7 @@ def render() -> None:
                         "total_pnl": "P&L ($)",
                         "roi_pct": "ROI%",
                     }),
-                    width="stretch",
+                    use_container_width=True,
                     hide_index=True,
                 )
 
@@ -404,7 +404,7 @@ def render() -> None:
                             "total_pnl": "P&L ($)",
                             "roi_pct": "ROI%",
                         }),
-                        width="stretch",
+                        use_container_width=True,
                         hide_index=True,
                     )
 
@@ -420,7 +420,7 @@ def render() -> None:
                         "actual_win_rate": "Actual Win%",
                         "roi_pct": "ROI%",
                     }),
-                    width="stretch",
+                    use_container_width=True,
                     hide_index=True,
                 )
             else:

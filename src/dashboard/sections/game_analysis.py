@@ -17,7 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.dashboard.pages.games import _fmt_odds, _fmt_line, _build_runs_per_game, _proj_total_for
+from src.dashboard.sections.games import _fmt_odds, _fmt_line, _build_runs_per_game, _proj_total_for
 from src.data.ballpark import PARK_FACTORS, get_park_factor
 
 
@@ -280,7 +280,7 @@ def render(
 
     with col_chart:
         fig = _win_prob_chart(home, away, home_prob, away_prob, home_impl, away_impl)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     with col_metrics:
         st.metric(f"{away} Model Prob", f"{away_prob:.1%}",

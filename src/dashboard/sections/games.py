@@ -17,7 +17,7 @@ from src.dashboard.components.signal_cards import severity_badge
 from src.shared.groq_agent import analyze_mlb_game
 from src.data.predictions_db import save_predictions
 from src.data.game_results import get_live_game_state
-from src.data.bet_log_db import load_bets, get_best_bet_type
+from src.data.bet_log_db import load_bets, get_best_bet_type, update_bet_outcome, update_parlay, OUTCOMES as _BET_OUTCOMES
 
 
 # Full team name → 3-letter abbreviation (for compact bet cell display)
@@ -165,7 +165,7 @@ def _render_bet_cards(
 
         with st.expander(
             f"{team} vs {opp}  |  {edge:.1f}% edge  |  Line: {line_str}  |  Stake: ${dollar_stake:,.0f}",
-            expanded=edge >= 6,
+            expanded=False,
         ):
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Model Prob",  f"{model_prob:.1%}")
@@ -182,11 +182,6 @@ def _render_bet_cards(
                 st.caption(f"🏠 {row.get('home_team','?')}: **{home_starter or 'TBD'}**")
             with s_col3:
                 st.caption(f"✈️ {row.get('away_team','?')}: **{away_starter or 'TBD'}**")
-
-            if status == "None":
-                st.caption("⚠️ No starters confirmed — prediction uses season Pythagorean only.")
-            elif status == "Partial":
-                st.caption("⚠️ One starter TBD — FIP adjustment applied for confirmed starter only.")
 
             st.markdown(
                 f"**Bet:** {team} &nbsp; {badge} &nbsp; Line: `{line_str}`",
@@ -278,6 +273,11 @@ def _render_bet_cards(
                         "edge_pct": edge,
                         "model_prob": round(model_prob, 4),
                         "stake": round(dollar_stake, 2),
+                        "bet_side": side,
+                        "home_team": row.get("home_team", ""),
+                        "away_team": row.get("away_team", ""),
+                        "home_odds": row.get("home_odds"),
+                        "away_odds": row.get("away_odds"),
                     })
                     st.toast(f"Added: ML {team}", icon="📌")
 
@@ -292,6 +292,15 @@ def _render_bet_cards(
                         "edge_pct": edge,
                         "model_prob": round(model_prob, 4),
                         "stake": round(dollar_stake, 2),
+                        "rl_team": team,
+                        "rl_spread": float(rl_point) if rl_point is not None else -1.5,
+                        "rl_side": side,
+                        "home_team": row.get("home_team", ""),
+                        "away_team": row.get("away_team", ""),
+                        "home_rl": home_rl,
+                        "away_rl": away_rl,
+                        "home_rl_odds": row.get("home_rl_odds"),
+                        "away_rl_odds": row.get("away_rl_odds"),
                     })
                     st.toast(f"Added: RL {rl_label}", icon="📌")
                 elif not rl_label:
@@ -308,6 +317,10 @@ def _render_bet_cards(
                         "edge_pct": 0.0,
                         "model_prob": None,
                         "stake": 50.0,
+                        "ou_direction": "Over" if ou_label.startswith("Over") else "Under",
+                        "ou_total": float(total) if total is not None else 8.5,
+                        "over_odds": float(over_o) if isinstance(over_o, (int, float)) else None,
+                        "under_odds": float(under_o) if isinstance(under_o, (int, float)) else None,
                     })
                     st.toast(f"Added: {ou_label}", icon="📌")
                 elif not ou_label:
@@ -439,6 +452,9 @@ def _render_game_detail_card(
 
     # ── Bet Slip Buttons — all markets, both teams ────────────────────────────
     st.divider()
+    if status != "Full":
+        st.info("⏳ Bet slip locked — both starting pitchers must be confirmed before adding bets.")
+        return
     st.caption("**Add to Bet Slip**")
 
     home_odds     = row.get("home_odds")
@@ -482,6 +498,11 @@ def _render_game_detail_card(
                 "edge_pct": away_edge_pct,
                 "model_prob": round(float(away_prob), 4) if away_prob else None,
                 "stake": stake,
+                "bet_side": "AWAY",
+                "home_team": home,
+                "away_team": away,
+                "home_odds": home_odds,
+                "away_odds": away_odds,
             })
             st.toast(f"Added: ML {away}", icon="📌")
     with ml_c2:
@@ -497,6 +518,11 @@ def _render_game_detail_card(
                 "edge_pct": home_edge_pct,
                 "model_prob": round(float(home_prob), 4) if home_prob else None,
                 "stake": stake,
+                "bet_side": "HOME",
+                "home_team": home,
+                "away_team": away,
+                "home_odds": home_odds,
+                "away_odds": away_odds,
             })
             st.toast(f"Added: ML {home}", icon="📌")
 
@@ -526,6 +552,15 @@ def _render_game_detail_card(
                 "edge_pct": away_rl_edge_rl,
                 "model_prob": round(float(away_rl_cov_prob), 4) if away_rl_cov_prob else None,
                 "stake": stake,
+                "rl_team": away,
+                "rl_spread": float(away_rl),
+                "rl_side": "AWAY",
+                "home_team": home,
+                "away_team": away,
+                "home_rl": home_rl,
+                "away_rl": away_rl,
+                "home_rl_odds": home_rl_odds,
+                "away_rl_odds": away_rl_odds,
             })
             st.toast(f"Added: RL {away}", icon="📌")
     with rl_c2:
@@ -544,6 +579,15 @@ def _render_game_detail_card(
                 "edge_pct": home_rl_edge_rl,
                 "model_prob": round(float(home_rl_cov_prob), 4) if home_rl_cov_prob else None,
                 "stake": stake,
+                "rl_team": home,
+                "rl_spread": float(home_rl),
+                "rl_side": "HOME",
+                "home_team": home,
+                "away_team": away,
+                "home_rl": home_rl,
+                "away_rl": away_rl,
+                "home_rl_odds": home_rl_odds,
+                "away_rl_odds": away_rl_odds,
             })
             st.toast(f"Added: RL {home}", icon="📌")
 
@@ -591,6 +635,10 @@ def _render_game_detail_card(
                 "edge_pct": over_edge_pct,
                 "model_prob": round(float(over_prob_model), 4) if over_prob_model else None,
                 "stake": 50.0,
+                "ou_direction": "Over",
+                "ou_total": float(total_line) if total_line is not None else 8.5,
+                "over_odds": float(over_odds) if isinstance(over_odds, (int, float)) else None,
+                "under_odds": float(under_odds) if isinstance(under_odds, (int, float)) else None,
             })
             st.toast(f"Added: Over {total_line}", icon="📌")
     with ou_c2:
@@ -607,6 +655,10 @@ def _render_game_detail_card(
                 "edge_pct": under_edge_pct,
                 "model_prob": round(float(under_prob_model), 4) if under_prob_model else None,
                 "stake": 50.0,
+                "ou_direction": "Under",
+                "ou_total": float(total_line) if total_line is not None else 8.5,
+                "over_odds": float(over_odds) if isinstance(over_odds, (int, float)) else None,
+                "under_odds": float(under_odds) if isinstance(under_odds, (int, float)) else None,
             })
             st.toast(f"Added: Under {total_line}", icon="📌")
 
@@ -911,6 +963,9 @@ def _fetch_schedule_for_date(date: datetime.date) -> list[dict]:
                 state = "pre"
 
             detail = g.get("status", {}).get("detailedState", "")
+            # Skip games that are not actually being played today
+            if any(kw in detail.lower() for kw in ("postponed", "cancel", "suspend")):
+                continue
             home_score = str(home_info.get("score", "")) if state != "pre" else ""
             away_score = str(away_info.get("score", "")) if state != "pre" else ""
 
@@ -1290,11 +1345,18 @@ def _render_daily_schedule(games: list[dict]) -> None:
         if bet_entries:
             _outcome_color = {"Win": "#2ecc71", "Loss": "#e74c3c", "Push": "#95a5a6", "Pending": "#f1c40f"}
             _outcome_icon  = {"Win": "✅", "Loss": "❌", "Push": "↩️", "Pending": "🎯"}
-            bet_cell = "<br>".join(
-                f'<span style="color:{_outcome_color.get(e["outcome"], "#f1c40f")};font-size:11px;font-weight:600">'
-                f'{_outcome_icon.get(e["outcome"], "🎯")} {_abbrev_bet_desc(e["desc"])}</span>'
-                for e in bet_entries
-            )
+            lines = []
+            for e in bet_entries:
+                color = _outcome_color.get(e["outcome"], "#f1c40f")
+                icon  = _outcome_icon.get(e["outcome"], "🎯")
+                tag   = "🔗 Parlay" if str(e.get("bet_type", "Single")) == "Parlay" else "Single"
+                tag_color = "#9b59b6" if tag == "🔗 Parlay" else "#555"
+                lines.append(
+                    f'<span style="color:{color};font-size:11px;font-weight:600">'
+                    f'{icon} {_abbrev_bet_desc(e["desc"])}</span>'
+                    f'<br><span style="color:{tag_color};font-size:10px">{tag}</span>'
+                )
+            bet_cell = "<br>".join(lines)
         else:
             bet_cell = '<span style="color:#444;font-size:11px">—</span>'
 
@@ -1389,8 +1451,8 @@ def _build_tomorrow_predictions(
         games_stub[col] = float("nan")
 
     def _lineup_status(row) -> str:
-        h = bool(row.get("home_starter_announced"))
-        a = bool(row.get("away_starter_announced"))
+        h = isinstance(row.get("home_starter"), str) and bool(row.get("home_starter"))
+        a = isinstance(row.get("away_starter"), str) and bool(row.get("away_starter"))
         if h and a:   return "Full"
         if h or a:    return "Partial"
         return "None"
@@ -1419,8 +1481,7 @@ def _build_tomorrow_predictions(
 
 def _load_today_bets() -> dict[str, list[dict]]:
     """
-    Return {matchup: [{"desc": str, "outcome": str}, ...]} for today's bets.
-    Includes Pending, Win, Loss, and Push so outcome-based coloring works.
+    Return {matchup: [{"desc", "outcome", "bet_type", "parlay_id"}, ...]} for today's bets.
     """
     import datetime as _dt
     try:
@@ -1435,12 +1496,30 @@ def _load_today_bets() -> dict[str, list[dict]]:
             if not key:
                 continue
             lookup.setdefault(key, []).append({
-                "desc":    str(row.get("bet_side", "")),
-                "outcome": str(row.get("outcome", "Pending")),
+                "desc":      str(row.get("bet_side", "")),
+                "outcome":   str(row.get("outcome", "Pending")),
+                "bet_type":  str(row.get("bet_type", "Single")),
+                "parlay_id": row.get("parlay_id"),
             })
         return lookup
     except Exception:
         return {}
+
+
+def _today_bets_summary() -> list[dict] | None:
+    """Return all of today's bets as a flat list for the summary banner, or None if none."""
+    import datetime as _dt
+    try:
+        log = load_bets()
+        if log.empty:
+            return None
+        today_str = str(_dt.date.today())
+        today_bets = log[log["date"] == today_str]
+        if today_bets.empty:
+            return None
+        return today_bets.to_dict("records")
+    except Exception:
+        return None
 
 
 def _render_games_analysis(
@@ -1467,10 +1546,12 @@ def _render_games_analysis(
     # Load today's pending bets for the "Your Bet" column
     your_bets: dict[str, list[str]] = {} if is_tomorrow else _load_today_bets()
 
-    # Auto-save predictions (today only — tomorrow has no odds to track yet)
+    # Auto-save predictions — today only, full lineups only (both starters confirmed)
     if not is_tomorrow and df["home_model_prob"].notna().any():
         try:
-            save_predictions(df, today.isoformat())
+            full_df = df[df["lineup_status"] == "Full"] if "lineup_status" in df.columns else df
+            if not full_df.empty:
+                save_predictions(full_df, today.isoformat())
         except Exception:
             pass
 
@@ -1524,7 +1605,10 @@ def _render_games_analysis(
     _sort_col = _BEST_TYPE_SORT.get(_best_bet_type or "", "best_bet_edge")
     if _sort_col not in table_ready.columns:
         _sort_col = "best_bet_edge"
-    table_ready = table_ready.sort_values(_sort_col, ascending=False)
+    _lineup_order = {"Full": 0, "Partial": 1, "None": 2}
+    table_ready["_lineup_sort"] = table_ready.get("lineup_status", pd.Series(dtype=str)).map(_lineup_order).fillna(3)
+    table_ready = table_ready.sort_values(["_lineup_sort", _sort_col], ascending=[True, False])
+    table_ready = table_ready.drop(columns=["_lineup_sort"])
 
     table_pending = pending_df.copy()
     if selected_team != "All":
@@ -1554,12 +1638,13 @@ def _render_games_analysis(
         return f"{t} {_fmt_odds(row.get(odds_key))}"
 
     def _rl_pick(row) -> str:
-        side = row.get("best_bet_side", "PASS")
-        if side == "PASS":
+        side = row.get("best_rl_side")
+        if not side or pd.isna(side) or str(side).upper() == "PASS":
             return "—"
-        t = row.get("home_team") if side == "HOME" else row.get("away_team")
-        rl_key      = "home_rl"      if side == "HOME" else "away_rl"
-        rl_odds_key = "home_rl_odds" if side == "HOME" else "away_rl_odds"
+        side_upper = str(side).upper()
+        t = row.get("home_team") if side_upper == "HOME" else row.get("away_team")
+        rl_key      = "home_rl"      if side_upper == "HOME" else "away_rl"
+        rl_odds_key = "home_rl_odds" if side_upper == "HOME" else "away_rl_odds"
         rl = row.get(rl_key)
         if rl is None or (isinstance(rl, float) and pd.isna(rl)):
             return "—"
@@ -1633,6 +1718,11 @@ def _render_games_analysis(
         table_ready["_total_edge_str"] = table_ready.apply(_total_edge_str, axis=1)
         table_ready["_complete"]      = True
         table_ready["_your_bet"]      = table_ready.apply(_your_bet_cell, axis=1)
+        # Blank out bet predictions for games without both starters confirmed
+        if "lineup_status" in table_ready.columns:
+            no_full = table_ready["lineup_status"] != "Full"
+            for _col in ["_ml_pick", "_rl_pick", "_total_pick", "_rl_edge_str", "_total_edge_str"]:
+                table_ready.loc[no_full, _col] = "—"
     if not table_pending.empty:
         table_pending = table_pending.copy()
         table_pending["_ml_pick"]        = "—"
@@ -1693,8 +1783,6 @@ def _render_games_analysis(
         ("_rl_edge_str",       "RL Edge%"),
         ("_total_pick",        "Total"),
         ("_total_edge_str",    "Total Edge%"),
-        ("home_model_prob",    "Home%"),
-        ("away_model_prob",    "Away%"),
     ]
     available_cols = [(k, v) for k, v in display_cols_order if k in combined.columns]
 
@@ -1725,15 +1813,18 @@ def _render_games_analysis(
                 except (TypeError, ValueError):
                     val = "—"
             elif col_key == "best_bet_edge":
-                try:
-                    fv = float(val)
-                    if col_key == _teal_col_key:
-                        colour = "#1abc9c" if fv >= 3.0 else "#e74c3c" if fv < 0 else "#888"
-                    else:
-                        colour = "#2ecc71" if fv >= 3.0 else "#e74c3c" if fv < 0 else "#888"
-                    val = f'<span style="color:{colour};font-weight:600">{fv:.1f}%</span>'
-                except (TypeError, ValueError):
+                if str(row.get("lineup_status", "None")) != "Full":
                     val = "—"
+                else:
+                    try:
+                        fv = float(val)
+                        if col_key == _teal_col_key:
+                            colour = "#1abc9c" if fv >= 3.0 else "#e74c3c" if fv < 0 else "#888"
+                        else:
+                            colour = "#2ecc71" if fv >= 3.0 else "#e74c3c" if fv < 0 else "#888"
+                        val = f'<span style="color:{colour};font-weight:600">{fv:.1f}%</span>'
+                    except (TypeError, ValueError):
+                        val = "—"
             elif col_key in ("_rl_edge_str", "_total_edge_str"):
                 s = str(val)
                 if s not in ("—", ""):
@@ -1798,10 +1889,14 @@ def _render_games_analysis(
     st.caption(detail_caption)
 
     all_detail = pd.concat([table_ready, table_pending], ignore_index=True)
+    if show_only_bets and "best_bet_side" in all_detail.columns:
+        all_detail = all_detail[all_detail["best_bet_side"] != "PASS"]
     if "best_bet_edge" in all_detail.columns:
+        _lo = {"Full": 0, "Partial": 1, "None": 2}
+        all_detail["_lineup_sort"] = all_detail.get("lineup_status", pd.Series(dtype=str)).map(_lo).fillna(3)
         all_detail = all_detail.sort_values(
-            ["_complete", "best_bet_edge"], ascending=[False, False]
-        ).reset_index(drop=True)
+            ["_lineup_sort", "_complete", "best_bet_edge"], ascending=[True, False, False]
+        ).drop(columns=["_lineup_sort"]).reset_index(drop=True)
 
     for idx, row in all_detail.iterrows():
         home = row.get("home_team", "?")
@@ -1818,7 +1913,7 @@ def _render_games_analysis(
         )) if your_bet_entries else ""
         label = f"{matchup_key}{bet_badge}{your_badge}"
         card_key_suffix = f"{'tmr' if is_tomorrow else 'today'}_{idx}"
-        with st.expander(label, expanded=(is_bet or bool(your_bet_entries))):
+        with st.expander(label, expanded=bool(your_bet_entries)):
             _render_game_detail_card(row, bankroll, team_stats, pitcher_stats, rpg)
 
     if is_tomorrow:
@@ -1832,36 +1927,22 @@ def _render_games_analysis(
 
     st.subheader("Recommended Bets")
 
-    bets = filtered_ready[filtered_ready["best_bet_side"] != "PASS"].sort_values("best_bet_edge", ascending=False)
+    # Only show bets where both starting lineups are confirmed
+    if "lineup_status" in filtered_ready.columns:
+        bets = filtered_ready[
+            (filtered_ready["best_bet_side"] != "PASS") &
+            (filtered_ready["lineup_status"] == "Full")
+        ].sort_values("best_bet_edge", ascending=False)
+    else:
+        bets = filtered_ready[filtered_ready["best_bet_side"] != "PASS"].sort_values("best_bet_edge", ascending=False)
+
     if bets.empty:
-        st.info("No bets meet the minimum edge threshold today.")
+        st.info("No bets with confirmed starting lineups meet the edge threshold today. Check back once starters are announced.")
         return
 
-    full_bets  = bets[bets.get("lineup_status", pd.Series(dtype=str)) == "Full"] \
-        if "lineup_status" in bets.columns else pd.DataFrame()
-    other_bets = bets[bets.get("lineup_status", pd.Series(dtype=str)) != "Full"] \
-        if "lineup_status" in bets.columns else bets
-
-    if not full_bets.empty:
-        st.markdown(f'### {_STATUS_HTML["Full"]} &nbsp; Full Confidence — Both Starters Confirmed', unsafe_allow_html=True)
-        st.caption("FIP, xFIP, and BABIP adjustments applied. Highest-confidence predictions.")
-        _render_bet_cards(full_bets, bankroll, team_stats, pitcher_stats, rpg)
-
-    if not other_bets.empty:
-        partial   = other_bets[other_bets.get("lineup_status", pd.Series(dtype=str)) == "Partial"] \
-            if "lineup_status" in other_bets.columns else pd.DataFrame()
-        none_bets = other_bets[other_bets.get("lineup_status", pd.Series(dtype=str)) == "None"] \
-            if "lineup_status" in other_bets.columns else other_bets
-
-        if not partial.empty:
-            st.markdown(f'### {_STATUS_HTML["Partial"]} &nbsp; Partial Lineup — One Starter Confirmed', unsafe_allow_html=True)
-            st.caption("FIP adjustment applied for confirmed starter only.")
-            _render_bet_cards(partial, bankroll, team_stats, pitcher_stats, rpg)
-
-        if not none_bets.empty:
-            st.markdown(f'### {_STATUS_HTML["None"]} &nbsp; No Lineup — Pythagorean Model Only', unsafe_allow_html=True)
-            st.caption("No starters announced yet. Prediction based on season run differential only. Use with caution.")
-            _render_bet_cards(none_bets, bankroll, team_stats, pitcher_stats, rpg)
+    st.markdown(f'### {_STATUS_HTML["Full"]} &nbsp; Both Starters Confirmed', unsafe_allow_html=True)
+    st.caption("FIP, BABIP, and bullpen adjustments applied. Predictions only available with full starting lineups.")
+    _render_bet_cards(bets, bankroll, team_stats, pitcher_stats, rpg)
 
 
 def _render_formula_banner(team_stats: pd.DataFrame | None) -> None:
@@ -1904,6 +1985,124 @@ def render(
             _clear_odds_cache()
             st.cache_data.clear()
             st.rerun()
+
+    # ── Today's Logged Bets Summary ───────────────────────────────────────────
+    summary_bets = _today_bets_summary()
+    if summary_bets:
+        _oc = {"Win": "#2ecc71", "Loss": "#e74c3c", "Push": "#95a5a6", "Pending": "#f1c40f"}
+        _oi = {"Win": "✅", "Loss": "❌", "Push": "↩️", "Pending": "🎯"}
+
+        singles = [b for b in summary_bets if str(b.get("bet_type", "Single")) != "Parlay"]
+        parlay_groups: dict[int, list[dict]] = {}
+        for b in summary_bets:
+            if str(b.get("bet_type", "Single")) == "Parlay":
+                pid = int(b.get("parlay_id") or 0)
+                parlay_groups.setdefault(pid, []).append(b)
+
+        all_cards = (
+            [("single", b) for b in singles]
+            + [("parlay", (pid, legs)) for pid, legs in parlay_groups.items()]
+        )
+
+        for chunk_start in range(0, len(all_cards), 4):
+            chunk = all_cards[chunk_start : chunk_start + 4]
+            cols = st.columns(len(chunk))
+            for col, (ctype, card_data) in zip(cols, chunk):
+                with col:
+                    if ctype == "single":
+                        b = card_data
+                        outcome = str(b.get("outcome", "Pending"))
+                        color   = _oc.get(outcome, "#f1c40f")
+                        icon    = _oi.get(outcome, "🎯")
+                        stake   = float(b.get("stake") or 0)
+                        pnl     = float(b.get("pnl") or 0)
+                        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                        bet_id  = int(b.get("id", 0))
+                        st.markdown(
+                            f'<div style="border:1px solid {color};border-radius:8px;'
+                            f'padding:8px 12px;margin-bottom:4px">'
+                            f'<div style="font-size:10px;color:#888">Single</div>'
+                            f'<div style="font-size:12px;font-weight:600;color:{color}">'
+                            f'{icon} {_abbrev_bet_desc(str(b.get("bet_side",""))[:40])}</div>'
+                            f'<div style="font-size:11px;color:#aaa">{b.get("matchup","")}</div>'
+                            f'<div style="font-size:11px;color:#888">Stake: ${stake:.2f} · '
+                            f'P&L: <span style="color:{color}">{pnl_str}</span></div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        with st.popover("✏️ Edit", use_container_width=True):
+                            st.markdown(f"**{b.get('matchup', '')}**")
+                            st.caption(
+                                f"Bet: {b.get('bet_side', '')}  ·  "
+                                f"Stake: ${stake:.2f}  ·  Line: {b.get('line', 'N/A')}"
+                            )
+                            new_outcome = st.selectbox(
+                                "Outcome",
+                                _BET_OUTCOMES,
+                                index=_BET_OUTCOMES.index(outcome) if outcome in _BET_OUTCOMES else 0,
+                                key=f"banner_outcome_{bet_id}",
+                            )
+                            line_val = float(b.get("line") or -110)
+                            if new_outcome == "Win":
+                                new_pnl = (
+                                    round(stake * line_val / 100, 2) if line_val > 0
+                                    else round(stake * 100 / abs(line_val), 2)
+                                )
+                            elif new_outcome == "Loss":
+                                new_pnl = -abs(stake)
+                            else:
+                                new_pnl = 0.0
+                            st.caption(f"Computed P&L: **${new_pnl:+.2f}**")
+                            if st.button("Save", key=f"banner_save_{bet_id}"):
+                                update_bet_outcome(bet_id, new_outcome, new_pnl)
+                                st.rerun()
+
+                    else:
+                        pid, legs = card_data
+                        total_stake = float(
+                            next((l.get("stake") or 0 for l in legs if float(l.get("stake") or 0) > 0), 0)
+                        )
+                        total_pnl = sum(float(l.get("pnl") or 0) for l in legs)
+                        outcome   = str(legs[0].get("outcome", "Pending"))
+                        color     = _oc.get(outcome, "#f1c40f")
+                        icon      = _oi.get(outcome, "🎯")
+                        pnl_str   = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+                        leg_lines = "".join(
+                            f'<div style="font-size:11px;color:#ccc">'
+                            f'· {_abbrev_bet_desc(str(l.get("bet_side",""))[:35])}</div>'
+                            for l in legs
+                        )
+                        st.markdown(
+                            f'<div style="border:1px solid {color};border-radius:8px;'
+                            f'padding:8px 12px;margin-bottom:4px">'
+                            f'<div style="font-size:10px;color:#9b59b6">🔗 {len(legs)}-Leg Parlay</div>'
+                            f'<div style="font-size:12px;font-weight:600;color:{color}">{icon} {outcome}</div>'
+                            f'{leg_lines}'
+                            f'<div style="font-size:11px;color:#888;margin-top:4px">'
+                            f'Stake: ${total_stake:.2f} · P&L: <span style="color:{color}">{pnl_str}</span></div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        with st.popover("✏️ Edit", use_container_width=True):
+                            st.markdown(f"**{len(legs)}-Leg Parlay #{pid}**")
+                            for l in legs:
+                                st.caption(f"• {l.get('matchup', '')}  —  {l.get('bet_side', '')}")
+                            new_outcome = st.selectbox(
+                                "Outcome",
+                                _BET_OUTCOMES,
+                                index=_BET_OUTCOMES.index(outcome) if outcome in _BET_OUTCOMES else 0,
+                                key=f"banner_parlay_outcome_{pid}",
+                            )
+                            new_stake = st.number_input(
+                                "Total Stake ($)",
+                                min_value=0.0,
+                                value=max(total_stake, 1.0),
+                                step=5.0,
+                                key=f"banner_parlay_stake_{pid}",
+                            )
+                            if st.button("Save", key=f"banner_parlay_save_{pid}"):
+                                update_parlay(pid, new_outcome, new_stake)
+                                st.rerun()
 
     # ── Full Day Schedule ─────────────────────────────────────────────────────
     try:
